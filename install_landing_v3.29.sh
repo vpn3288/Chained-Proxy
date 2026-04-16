@@ -2,6 +2,8 @@
 set -euo pipefail
 IFS=$'\n\t'
 
+# v3.29 变更记录
+# - R71: 修复 DIM-6 Mux配置缺失 — freedom outbound 添加 "mux":{"enabled":true,"concurrency":8}
 # v3.28 变更记录
 # - 更新版本号至 v3.28
 # - 修正防火墙持久化模板、bulldozer 多行删除、SSH 端口恢复探测与卸载清理
@@ -28,7 +30,7 @@ IFS=$'\n\t'
 #   - systemd 服务/降级 drop-in 与状态机边界进一步加固
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-readonly VERSION="v3.28"
+readonly VERSION="v3.29"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -1097,7 +1099,7 @@ cfg = {
     },
     "outbounds": [
         {"protocol": "dns", "tag": "dns-out", "settings": {"address": "1.1.1.1", "port": 53}},
-        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIP"}},
+        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIP"}, "mux": {"enabled": true, "concurrency": 8}},
         {"protocol": "blackhole", "tag": "blocked", "settings": {"response": {"type": "none"}}}
     ],
     "routing": {
