@@ -20,7 +20,8 @@ IFS=$'\n\t'
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # R77: 修复atomic_write mktemp空路径检查、nginx快照失败hard-die
-readonly VERSION="v3.29-Optimized"
+# R76: 修复所有mktemp空路径fallback错误检查
+readonly VERSION="v3.30-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -475,7 +476,7 @@ _tune_nginx_worker_connections(){
   # [F4] Snapshot before sed mutations so nginx.conf can be restored on nginx -t failure
   # [v2.13 GPT-🟠] nginx.conf snapshot moved from /tmp to script-owned MANAGER_BASE/tmp
   local _mc_bak; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX" 2>/dev/null) \
-    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX"); }
+    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX") || die "mktemp _mc_bak failed (disk full?)"; }
   cp -a "$mc" "$_mc_bak" || { warn "nginx.conf snapshot failed, skipping tuning"; return 0; }
   local _mc_dirty=0
   # [v2.9 GPT-A-🟠] Recompute _fd_max here (same RAM×800 formula as optimize_kernel_network)
@@ -838,8 +839,10 @@ _bulldoze_input_refs6_t(){
   local _snap_persist=""
   local _persist_script="${MANAGER_BASE}/firewall-restore.sh"
   if [[ -f "$_persist_script" ]]; then
-    _snap_persist=$(mktemp "${MANAGER_BASE}/.transit-mgr.XXXXXX") || _snap_persist=""
-    [[ -n "$_snap_persist" ]] && cp -f "$_persist_script" "$_snap_persist" 2>/dev/null || _snap_persist=""
+    _snap_persist=$(mktemp "${MANAGER_BASE}/.transit-mgr.XXXXXX") \
+      || die "mktemp _snap_persist failed — rollback snapshot unavailable"
+    cp -f "$_persist_script" "$_snap_persist" \
+      || die "snapshot persist script failed — rollback will be impaired"
   fi
 
   local _prev_err_trap _prev_int_trap _prev_term_trap
@@ -1120,11 +1123,22 @@ _atomic_apply_route(){
   # 1. 快照旧文件（失败时回滚用）
   local _snap_map="" _snap_meta=""
   mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
-  [[ -f "$map_target"  ]] && { _snap_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX"); cp -f "$map_target"  "$_snap_map";  } || true
-  [[ -f "$meta_target" ]] && { _snap_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX");    cp -f "$meta_target" "$_snap_meta"; } || true
+  if [[ -f "$map_target" ]]; then
+    _snap_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
+      || die "mktemp _snap_map failed"
+    cp -f "$map_target" "$_snap_map" \
+      || die "snapshot map_target failed"
+  fi
+  if [[ -f "$meta_target" ]]; then
+    _snap_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
+      || die "mktemp _snap_meta failed"
+    cp -f "$meta_target" "$_snap_meta" \
+      || die "snapshot meta_target failed"
+  fi
 
   # 2. 写新 .map（原子 mv 到正式路径供 nginx -t）
-  local tmp_map; tmp_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX")
+  local tmp_map; tmp_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
+    || die "mktemp tmp_map failed"
   local _map_key; _map_key=$(nginx_domain_str "$domain")
   [[ -n "$_map_key" && ${#_map_key} -le 200 ]] \
     || { rm -f "$tmp_map" 2>/dev/null; die "域名过滤后为空或超长，拒绝写入 map: ${domain}"; }
@@ -1154,7 +1168,8 @@ _atomic_apply_route(){
   # old map (which we will roll back); prevents truth-source split where nginx routes new IP
   # but .meta is missing. Old order (reload→meta) left a window where nginx served new IP
   # with no truth record on disk-full or permission error.
-  local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX")
+  local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
+    || die "mktemp tmp_meta failed"
   printf 'DOMAIN=%s\nTRANSIT_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
     "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta"
   chmod 600 "$tmp_meta"
@@ -1444,7 +1459,8 @@ add_landing_route(){
   # 五步原子变更: 快照已有 snippet（使用独立前缀避免被 _global_cleanup 误删）
   local _old_bak=""
   if [[ -f "${SNIPPETS_DIR}/landing_${safe}.map" ]]; then
-    _old_bak=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX")
+    _old_bak=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
+      || die "mktemp _old_bak failed"
     cp -f "${SNIPPETS_DIR}/landing_${safe}.map" "$_old_bak" 2>/dev/null || _old_bak=""
   fi
 
@@ -1488,12 +1504,16 @@ delete_landing_route(){
   # 五步原子变更：快照 .map + .meta，nginx_reload 失败时恢复
   local _bak_map="" _bak_meta=""
   [[ -f "${SNIPPETS_DIR}/landing_${safe_del}.map" ]] && {
-    _bak_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX")
-    cp -f "${SNIPPETS_DIR}/landing_${safe_del}.map" "$_bak_map"
+    _bak_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
+      || die "mktemp _bak_map failed"
+    cp -f "${SNIPPETS_DIR}/landing_${safe_del}.map" "$_bak_map" \
+      || die "snapshot landing map failed"
   }
   [[ -f "${CONF_DIR}/${safe_del}.meta" ]] && {
-    _bak_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX")
-    cp -f "${CONF_DIR}/${safe_del}.meta" "$_bak_meta"
+    _bak_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
+      || die "mktemp _bak_meta failed"
+    cp -f "${CONF_DIR}/${safe_del}.meta" "$_bak_meta" \
+      || die "snapshot landing meta failed"
   }
 
   remove_landing_snippet "$DEL_DOMAIN"
@@ -1584,8 +1604,10 @@ purge_all(){
   # 原子卸载序：先改 nginx.conf → 显式校验 include 已移除 → 再删文件 → 再次 nginx -t → reload
   local _purge_bak=""
   if [[ -f "$NGINX_MAIN_CONF" ]]; then
-    _purge_bak=$(mktemp "${MANAGER_BASE}/.snap-recover.XXXXXX" 2>/dev/null) || _purge_bak=""
-    [[ -n "$_purge_bak" ]] && cp -f "$NGINX_MAIN_CONF" "$_purge_bak" 2>/dev/null || true
+    _purge_bak=$(mktemp "${MANAGER_BASE}/.snap-recover.XXXXXX") \
+      || die "mktemp _purge_bak failed"
+    cp -f "$NGINX_MAIN_CONF" "$_purge_bak" \
+      || die "snapshot nginx.conf for purge failed"
     sed -i "\#${STREAM_INCLUDE_MARKER}#d" "$NGINX_MAIN_CONF" 2>/dev/null || true
     sed -i "\#include ${NGINX_STREAM_CONF};#d" "$NGINX_MAIN_CONF" 2>/dev/null || true
     sed -i "/# transit-manager-tuning-v${VERSION}/d" "$NGINX_MAIN_CONF" 2>/dev/null || true

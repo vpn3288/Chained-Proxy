@@ -33,7 +33,8 @@ IFS=$'\n\t'
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # R77: 修复所有CRITICAL mktemp空路径检查、daemon-reload失败hard-die、firewall规则错误检查
-readonly VERSION="v3.31"
+# R76: 修复所有mktemp空路径fallback错误检查
+readonly VERSION="v3.32"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -490,7 +491,8 @@ install_xray_binary(){
   local zip_name="Xray-linux-${arch_name}.zip"
   # [v2.13 GPT-🟠] Xray download tmpdir moved from global /tmp to script-owned MANAGER_BASE/tmp
   mkdir -p "${MANAGER_BASE}/tmp"
-  local tmp_dir; tmp_dir=$(mktemp -d "${MANAGER_BASE}/tmp/xray_tmp_XXXXXX")
+  local tmp_dir; tmp_dir=$(mktemp -d "${MANAGER_BASE}/tmp/xray_tmp_XXXXXX") \
+    || die "mktemp tmp_dir failed"
   # [v2.13] xray_tmp dirs now under MANAGER_BASE/tmp; _global_cleanup handles cleanup on crash
   # 严禁用 EXIT trap（会覆写全局 _global_cleanup）
   _xray_local_cleanup(){ rm -rf "${tmp_dir}" 2>/dev/null || true; }
@@ -537,7 +539,7 @@ _tune_nginx_worker_connections(){
   # [F4] Take snapshot before any sed mutation so nginx.conf can be restored on validation fail
   # [v2.13 GPT-🟠] nginx.conf snapshot moved to script-owned MANAGER_BASE/tmp
   local _mc_bak; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX" 2>/dev/null) \
-    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX"); }
+    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX") || die "mktemp _mc_bak fallback failed — disk full?"; }
   cp -a "$mc" "$_mc_bak" || { warn "nginx.conf snapshot failed, skipping tuning"; return 0; }
   local _mc_dirty=0
   # [v2.9 GPT-B-🔴] Recompute dynamic FD ceiling here (same RAM×800 formula as
