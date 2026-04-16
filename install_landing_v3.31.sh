@@ -32,7 +32,8 @@ IFS=$'\n\t'
 #   - systemd 服务/降级 drop-in 与状态机边界进一步加固
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-readonly VERSION="v3.30"
+# R77: 修复所有CRITICAL mktemp空路径检查、daemon-reload失败hard-die、firewall规则错误检查
+readonly VERSION="v3.31"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
@@ -603,7 +604,7 @@ StandardError=null
 SVCOV
   # [F4] Hard-fail: drop-in on disk but systemd runs stale graph if reload fails
   systemctl daemon-reload \
-    || { warn "nginx service.d daemon-reload failed; limits will take effect on next reboot"; }
+    || die "systemctl daemon-reload failed — drop-in limits will not apply (nginx may hit FD limit under load)"
 }
 
 setup_fallback_decoy(){
@@ -1187,7 +1188,8 @@ JDEOF
 create_systemd_service(){
   # [v2.13 GPT-🟠] Service unit staging file moved from /tmp to script-owned MANAGER_BASE/tmp
   mkdir -p "${MANAGER_BASE}/tmp"
-  local _svc_tmp; _svc_tmp=$(mktemp "${MANAGER_BASE}/tmp/.xray-landing.svc.XXXXXX")
+  local _svc_tmp; _svc_tmp=$(mktemp "${MANAGER_BASE}/tmp/.xray-landing.svc.XXXXXX") \
+    || die "mktemp _svc_tmp failed — MANAGER_BASE/tmp missing or disk full"
   cat > "$_svc_tmp" <<'SVCEOF'
 [Unit]
 Description=Xray Landing Node (independent from mack-a)
@@ -1733,7 +1735,8 @@ PYIP
   # Committing manager.conf before cert issuance creates a durable half-state on cert failure.
   local _staged_mgr=""
   if [[ -n "$CF_TOKEN" ]]; then
-    _staged_mgr=$(mktemp "${MANAGER_BASE}/tmp/.manager.XXXXXX")
+    _staged_mgr=$(mktemp "${MANAGER_BASE}/tmp/.manager.XXXXXX") \
+      || die "mktemp _staged_mgr failed"
     atomic_write "$_staged_mgr" 600 root:root <<SMEOF
 LANDING_PORT=${LANDING_PORT}
 VLESS_UUID=${VLESS_UUID}
@@ -1757,7 +1760,8 @@ SMEOF
 
   # 🔴 Grok: 临时文件必须以 .conf 结尾，Python glob(*.conf) 才能扫到新节点
   # 不用 .snap-recover 前缀（dotfile 被 glob 跳过），用 tmp- 前缀区分
-  local _tmp_node; _tmp_node=$(mktemp "${MANAGER_BASE}/nodes/tmp-XXXXXX.conf")
+  local _tmp_node; _tmp_node=$(mktemp "${MANAGER_BASE}/nodes/tmp-XXXXXX.conf") \
+    || die "mktemp _tmp_node failed — MANAGER_BASE/nodes missing or disk full"
   cat >"$_tmp_node" <<NEOF_TMP
 DOMAIN=${NEW_DOMAIN}
 PASSWORD=${NEW_PASS}
@@ -1819,7 +1823,8 @@ NEOF_TMP
       die "节点文件名碰撞：${_node_conf} 已被中转 IP ${_exist_tip} 使用，拒绝覆盖 ${NEW_TRANSIT}"
     fi
   fi
-  local _snap_cfg_node; _snap_cfg_node=$(mktemp "${LANDING_BASE}/.snap-recover.XXXXXX" 2>/dev/null) || _snap_cfg_node=""
+  local _snap_cfg_node; _snap_cfg_node=$(mktemp "${LANDING_BASE}/.snap-recover.XXXXXX" 2>/dev/null) \
+    || die "mktemp _snap_cfg_node failed"
   [[ -n "$_snap_cfg_node" && -f "$LANDING_CONF" ]] && cp -f "$LANDING_CONF" "$_snap_cfg_node" 2>/dev/null || true
   mv -f "$_tmp_node" "$_node_conf"
   _int_sync_done=0
@@ -1905,8 +1910,10 @@ delete_node(){
   # not a dynamic regeneration that can fail silently and leave config.json inconsistent.
   local _snap_cfg_del=""
   [[ -f "$LANDING_CONF" ]] && {
-    _snap_cfg_del=$(mktemp "${LANDING_BASE}/.snap-recover.XXXXXX")
-    cp -f "$LANDING_CONF" "$_snap_cfg_del"
+    _snap_cfg_del=$(mktemp "${LANDING_BASE}/.snap-recover.XXXXXX") \
+      || die "mktemp _snap_cfg_del failed"
+    cp -f "$LANDING_CONF" "$_snap_cfg_del" \
+      || die "snapshot LANDING_CONF failed"
   }
 
   # 五步原子变更
@@ -1914,8 +1921,10 @@ delete_node(){
   # the rename and sync_xray_config completing. glob(*.conf) excludes .deleting; setup_firewall
   # also rescans *.conf so the IP is removed from the whitelist correctly.
   # The .deleting file is removed only after service restart confirms success.
-  local _snap_node; _snap_node=$(mktemp "${MANAGER_BASE}/nodes/.snap-recover.XXXXXX")
-  cp -f "$DEL_CONF" "$_snap_node"
+  local _snap_node; _snap_node=$(mktemp "${MANAGER_BASE}/nodes/.snap-recover.XXXXXX") \
+    || die "mktemp _snap_node failed"
+  cp -f "$DEL_CONF" "$_snap_node" \
+    || die "snapshot DEL_CONF failed"
   mv -f "$DEL_CONF" "${DEL_CONF}.deleting"
 
   local __delete_node_trap_active=1
@@ -2510,6 +2519,8 @@ purge_all(){
     systemctl reload nginx 2>/dev/null || true
   fi
   if [[ "${_created_user:-0}" == "1" ]]; then
+    # Guard: LANDING_USER must be non-empty even if _created_user=1
+    [[ -n "$LANDING_USER" ]] || { warn "LANDING_USER is empty (manager.conf corrupted?), skipping user cleanup"; }
     command -v loginctl >/dev/null 2>&1 && loginctl terminate-user "$LANDING_USER" 2>/dev/null || true
     pkill -u "$LANDING_USER" 2>/dev/null || true
     sleep 1
@@ -2768,7 +2779,7 @@ fresh_install(){
   # [v2.8 Architect-🔴] Stage manager.conf to a temp path; promote to the real path only after
   # sync_xray_config + create_systemd_service + setup_firewall all succeed.
   local _staged_fi_mgr; _staged_fi_mgr=$(mktemp "${MANAGER_BASE}/tmp/.manager.XXXXXX") \
-    || true
+    || die "mktemp _staged_fi_mgr failed — MANAGER_BASE/tmp missing or disk full"
   atomic_write "$_staged_fi_mgr" 600 root:root <<SMFI
 LANDING_PORT=${LANDING_PORT}
 VLESS_UUID=${VLESS_UUID}

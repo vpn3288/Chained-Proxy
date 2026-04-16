@@ -19,7 +19,8 @@ IFS=$'\n\t'
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-readonly VERSION="v3.28-Optimized"
+# R77: 修复atomic_write mktemp空路径检查、nginx快照失败hard-die
+readonly VERSION="v3.29-Optimized"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -95,12 +96,17 @@ atomic_write()(
   local target="$1" mode="$2" owner_group="${3:-root:root}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir"
-  tmp="$(mktemp "$dir/.transit-mgr.XXXXXX")"
+  tmp="$(mktemp "$dir/.transit-mgr.XXXXXX")" \
+    || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
-  cat >"$tmp"
-  chmod "$mode" "$tmp"
-  chown "$owner_group" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$target"
+  cat >"$tmp" \
+    || { echo "atomic_write: cat to $tmp failed" >&2; exit 1; }
+  chmod "$mode" "$tmp" \
+    || { echo "atomic_write: chmod failed for $tmp" >&2; exit 1; }
+  chown "$owner_group" "$tmp" 2>/dev/null \
+    || { echo "atomic_write: chown failed for $tmp" >&2; exit 1; }
+  mv -f "$tmp" "$target" \
+    || { echo "atomic_write: mv $tmp -> $target failed" >&2; exit 1; }
 )
 
 # v2.32: 全局写操作互斥锁，防止两个终端并发修改同一状态
@@ -681,13 +687,16 @@ NGINX_STREAM_EOF
   local _mc_bak="${NGINX_MAIN_CONF}.transit.bak_$(date +%s)"
   cp -f "$NGINX_MAIN_CONF" "$_mc_bak" 2>/dev/null || true
   ls -t "${NGINX_MAIN_CONF}.transit.bak_"* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
-  local _mc_tmp; _mc_tmp=$(mktemp "${NGINX_MAIN_CONF%/*}/.snap-recover.XXXXXX")
-  cp -f "$NGINX_MAIN_CONF" "$_mc_tmp"
-  # 两行分开 printf，避免任何 \n 解析歧义
+  local _mc_tmp; _mc_tmp=$(mktemp "${NGINX_MAIN_CONF%/*}/.snap-recover.XXXXXX") \
+    || die "mktemp _mc_tmp failed"
+  cp -f "$NGINX_MAIN_CONF" "$_mc_tmp" \
+    || die "snapshot nginx.conf failed"
   printf '\n# %s\n' "$STREAM_INCLUDE_MARKER"  >> "$_mc_tmp"
   printf 'include %s;\n'    "$NGINX_STREAM_CONF" >> "$_mc_tmp"
-  chmod 644 "$_mc_tmp"
-  mv -f "$_mc_tmp" "$NGINX_MAIN_CONF"
+  chmod 644 "$_mc_tmp" \
+    || die "chmod _mc_tmp failed"
+  mv -f "$_mc_tmp" "$NGINX_MAIN_CONF" \
+    || die "promote _mc_tmp to nginx.conf failed"
   # 验证注入成功
   grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" \
     || die "nginx.conf include 注入失败，请检查文件权限: ${NGINX_MAIN_CONF}"
