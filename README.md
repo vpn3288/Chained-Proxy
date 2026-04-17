@@ -20,8 +20,8 @@
         ▼
 ┌─────────────────┐
 │  Landing 节点    │  ← 落地机 (境外VPS)
-│  Xray-core      │     端口: 443 (TLS终
-│  Trojan 协议    │       证书由 acme.sh
+│  Xray-core      │     端口: 443 (TLS终端)
+│  Trojan 协议    │     证书由 acme.sh
 │  acme.sh TLS   │       自动申请)
 └───────┬─────────┘
         │  原始流量
@@ -53,8 +53,8 @@
 ### 第1步：在 Landing（落地机）上运行
 
 ```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_landing_v3.36.sh -o install_landing.sh
+# 下载脚本（当前版本: R80）
+curl -fsSL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_landing.sh -o install_landing.sh
 
 # 运行安装（需要 root）
 sudo bash install_landing.sh
@@ -72,8 +72,8 @@ Trojan 密码: trojan://your-password@your-domain:443
 ### 第2步：在 Transit（中转机）上运行
 
 ```bash
-# 下载脚本
-curl -fsSL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_transit_v3.34-Optimized.sh -o install_transit.sh
+# 下载脚本（当前版本: R20）
+curl -fsSL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_transit.sh -o install_transit.sh
 
 # 运行安装（需要 root）
 sudo bash install_transit.sh
@@ -154,10 +154,10 @@ sudo ~/.acme.sh/acme.sh.sh --renew -d your-domain.com --force
 
 ```bash
 # Transit
-sudo bash install_transit_v3.34-Optimized.sh --uninstall
+sudo bash install_transit.sh --uninstall
 
 # Landing
-sudo bash install_landing_v3.36.sh --uninstall
+sudo bash install_landing.sh --uninstall
 ```
 
 ## 端口说明
@@ -238,12 +238,18 @@ ping [Landing-domain]
 
 ## 更新日志
 
-### v3.36 (Landing)
+### v3.36-R80 (Landing)
+- **R80**: 修复 xray reload/restart 语法（log_error → error），完善错误处理
+- **R79**: 修复 daemon-reload triple chain 死代码（exit 1 后 || die 不执行）
+- **R78**: trap ERR 修复，避免非预期级联退出
 - 优化 Xray Mux 配置
 - 改进幂等性
 - 修复多出边界情况
 
-### v3.34-Optimized (Transit)
+### v3.35-R20 (Transit)
+- **R20**: daemon-reload 在 rollback 函数内使用 || true（清理场景正确做法）
+- **R19**: atomic swap 用 FWDUMMY rename 替代 flush-then-rebuild，sync 加在 atomic_write 后
+- **R18**: daemon-reload 增加 || die 检测，ERR trap 移除避免级联退出
 - Nginx Stream 优化
 - 改进 SNI 路由逻辑
 - 增强卸载完整性
