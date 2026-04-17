@@ -168,46 +168,25 @@ validate_domain(){
   # RFC1035 长度守卫 + 必须含点
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
-  python3 - "$d" <<'PY' >/dev/null 2>&1 || die "域名格式非法: $d"
-import re, sys
-d = sys.argv[1].strip()
-pat = re.compile(
-    r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)'
-    r'(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*'
-    r'\.[a-zA-Z0-9]{2,}$'
-)
-raise SystemExit(0 if pat.match(d) else 1)
-PY
+  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || die "域名格式非法: $d"
 }
 
 validate_ipv4(){
   local ip="$1"
-  python3 - "$ip" <<'PY' >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
-import ipaddress, sys
-try:
-    ipaddress.IPv4Address(sys.argv[1].strip())
-except ValueError:
-    raise SystemExit(1)
-PY
-}
-
-validate_ip(){
-  local ip="$1"
-  [[ "$ip" =~ : ]] && die "拓扑冲突：中转机无 IPv6 路由时（CN2GIA），严禁使用 IPv6 落地机地址: $ip"
-  
-  # v2.27: Python使用argv传参避免注入
-  python3 - "$ip" <<'PYEOF'
-import ipaddress, sys
-ip = sys.argv[1]
+  printf '%s' "$ip" | python3 -c "import ipaddress, sys
+ip = sys.stdin.read().strip()
 try:
     a = ipaddress.IPv4Address(ip)
     if a.is_loopback or a.is_private or a.is_link_local or a.is_multicast or a.is_reserved or a.is_unspecified:
         sys.exit(1)
 except:
     sys.exit(1)
-PYEOF
-  [[ $? -eq 0 ]] || die "IP 地址属于保留/特殊范围，禁止使用: $ip"
-  
+" >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
+}
+
+validate_ip(){
+  local ip="$1"
+  [[ "$ip" =~ : ]] && die "拓扑冲突：中转机无 IPv6 路由时（CN2GIA），严禁使用 IPv6 落地机地址: $ip"
   validate_ipv4 "$ip"
 }
 
@@ -1246,18 +1225,18 @@ generate_nodes(){
     echo ""
 
     local sub_b64="" _sub_err=""
-    # Bug T-1 FIX: f-string `{}` 内不能有 \" (Python<3.12 SyntaxError)
-    # 改为先把标签字符串赋值给 Python 变量，再在 f-string 中引用变量
-    sub_b64=$(python3 -c "
+    # Pass 5 values via stdin, Python reads them without argv injection risk
+    sub_b64=$(printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" | python3 <<'PY' 2>&1) \
+    || { _sub_err="$sub_b64"; sub_b64=""; }
+
 import base64, urllib.parse, sys
-transit_ip, domain, vless_uuid, trojan_pass, pfx = \
-    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+lines = [l.strip() for l in sys.stdin.read().split('\n') if l.strip()]
+if len(lines) < 5:
+    raise SystemExit(1)
+transit_ip, domain, vless_uuid, trojan_pass, pfx = lines[0], lines[1], lines[2], lines[3], lines[4]
 port = 443
-# 标签变量：避免在 f-string {} 内使用 \\\" (Python<3.12 SyntaxError)
 lbl_vision = '[禁Mux]VLESS-Vision-'
 lbl_vgrpc  = 'VLESS-gRPC-'
-# v2.39: Trojan-gRPC已禁用 (被VLESS-gRPC抢占h2流量)
-# lbl_tgrpc  = 'Trojan-gRPC-'
 lbl_vws    = 'VLESS-WS-'
 lbl_ttcp   = 'Trojan-TCP-'
 uris = [
@@ -1269,11 +1248,6 @@ uris = [
      f'?encryption=none&security=tls&sni={domain}&fp=edge'
      f'&type=grpc&serviceName={pfx}-vg&alpn=h2&mode=multi'
      f'#{urllib.parse.quote(lbl_vgrpc+domain)}'),
-    # v2.39: Trojan-gRPC已禁用
-    # (f'trojan://{urllib.parse.quote(trojan_pass)}@{transit_ip}:{port}'
-    #  f'?security=tls&sni={domain}&fp=ios'
-    #  f'&type=grpc&serviceName={pfx}-tg&alpn=h2&mode=multi'
-    #  f'#{urllib.parse.quote(lbl_tgrpc+domain)}'),
     (f'vless://{vless_uuid}@{transit_ip}:{port}'
      f'?encryption=none&security=tls&sni={domain}&fp=firefox'
      f'&type=ws&path=%2F{pfx}-vw&host={domain}&alpn=http/1.1'
@@ -1283,8 +1257,7 @@ uris = [
      f'#{urllib.parse.quote(lbl_ttcp+domain)}'),
 ]
 print(base64.b64encode('\n'.join(uris).encode()).decode())
-" "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" 2>&1) \
-    || { _sub_err="$sub_b64"; sub_b64=""; }
+PY
 
     if [[ -n "$sub_b64" ]]; then
       echo -e "  ${BOLD}Base64 订阅（粘贴到客户端「添加订阅」）:${NC}"
@@ -1314,26 +1287,23 @@ import_token(){
   (( ${#raw} <= 2048 )) || die "token 过长（${#raw} 字节），拒绝解析"
 
   local json=""
-  json=$(python3 - "$raw" <<'PY' 2>/dev/null
+  json=$(printf '%s' "$raw" | python3 -c "
 import base64
 import json
 import re
 import sys
-
-raw = sys.argv[1].strip()
-m = re.search(r'(?<![A-Za-z0-9+/=])(?:eyJ|eyA)[A-Za-z0-9+/=]{20,}(?![A-Za-z0-9+/=])', raw)
+raw = sys.stdin.read().strip()
+m = re.search(r'(?<![A-Za-z0-9+/=])(?:eyJ|ey A)[A-Za-z0-9+/=]{20,}(?![A-Za-z0-9+/=])', raw)
 if not m:
     m = re.search(r'(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{40,}(?![A-Za-z0-9+/=])', raw)
 if not m:
     raise SystemExit(1)
-
 token = m.group(0)
 pad = '=' * (-len(token) % 4)
 decoded = base64.b64decode(token + pad).decode()
 json.loads(decoded)
 print(decoded)
-PY
-) || die "无法解析 Base64 token，请检查输入"
+" 2>/dev/null) || die "无法解析 Base64 token，请检查输入"
 
   local ip="" dom="" port="" uuid="" pwd="" pfx=""
   ip=$(python3  -c "import json,sys; d=json.loads(sys.stdin.read()); print(d['ip'])"  <<< "$json" 2>/dev/null) \
@@ -1345,7 +1315,7 @@ PY
   validate_port "$port"
 
   # Transit Bug 37 / Token import validation: ip 必须是合法 IPv4，否则给出明确指引
-  if ! python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])" "$ip" 2>/dev/null; then
+  if ! printf '%s' "$ip" | python3 -c "import ipaddress, sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
     die "token 中 ip='${ip}' 不是合法 IPv4 地址！\n  可能原因：落地机生成 Token 时 ip/dom 参数位移（Bug 40）\n  修复方法：在落地机重新执行 bash install_landing_v3.28.sh 并检查落地机 PUBLIC_IP 是否正确"
   fi
 

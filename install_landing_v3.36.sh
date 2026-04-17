@@ -288,33 +288,20 @@ validate_domain(){
   d="$(trim "$1")"
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
-  python3 - "$d" <<'PY' >/dev/null 2>&1 || die "域名格式非法: $d"
-import re, sys
-d = sys.argv[1].strip()
-pat = re.compile(
-    r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)'
-    r'(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*'
-    r'\.[a-zA-Z0-9]{2,}$'
-)
-raise SystemExit(0 if pat.match(d) else 1)
-PY
+  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || die "域名格式非法: $d"
 }
 
 validate_ipv4(){
   local ip="$1"
-  python3 - "$ip" <<'PY' >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
-import ipaddress, sys
+  printf '%s' "$ip" | python3 -c "import ipaddress, sys
+ip = sys.stdin.read().strip()
 try:
-    addr = ipaddress.IPv4Address(sys.argv[1].strip())
-    # 拦截特殊/私网地址
-    if addr.is_loopback or addr.is_unspecified or addr.is_reserved or addr.is_multicast or addr.is_link_local:
-        raise SystemExit(1)
-    # RFC1918 私网地址拦截
-    if addr.is_private:
+    addr = ipaddress.IPv4Address(ip)
+    if addr.is_loopback or addr.is_unspecified or addr.is_reserved or addr.is_multicast or addr.is_link_local or addr.is_private:
         raise SystemExit(1)
 except ValueError:
     raise SystemExit(1)
-PY
+" >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
 }
 
 validate_port(){
@@ -1443,7 +1430,7 @@ setup_firewall(){
     if [[ -z "$tip" ]]; then
       warn "  [跳过] 节点文件 ${meta} 缺少 TRANSIT_IP 字段"; (( ++skipped )) || true; continue
     fi
-    if ! python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])" "$tip" 2>/dev/null; then
+    if ! printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
       warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法"; (( ++skipped )) || true; continue
     fi
     tips+=("$tip")
@@ -1515,7 +1502,7 @@ _persist_iptables(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2-) || continue
-    python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])" "$tip" 2>/dev/null && transit_ips+=("$tip") || true
+    printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
 
   local _fw_sig="LANDING_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -2300,28 +2287,17 @@ print_pairing_info(){
   local token=""
   # BUG-40 FIX: Token ip 字段必须是落地机公网 IPv4，dom 必须是域名
   # 用 python3 ipaddress 模块验证 pub_ip 确实是合法 IPv4，防止位移错误静默通过
-  if ! python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])" "$pub_ip" 2>/dev/null; then
+  if ! printf '%s' "$pub_ip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
     die "pub_ip='${pub_ip}' 不是合法 IPv4，拒绝生成 Token"
   fi
-  token=$(python3 - "$pub_ip" "$domain" "$LANDING_PORT" "$VLESS_UUID" "$password" 2>&1 <<'TOKPY'
+  token=$(printf '%s\n%s\n%s\n%s\n%s' "$pub_ip" "$domain" "$LANDING_PORT" "$VLESS_UUID" "$password" | python3 -c "
 import json, base64, sys
-# argv: 1=pub_ip(IPv4)  2=domain  3=port  4=uuid  5=password
-landing_ip   = sys.argv[1]   # 落地机公网 IP  → Token['ip']
-landing_dom  = sys.argv[2]   # 落地机域名(SNI) → Token['dom']
-landing_port = int(sys.argv[3])
-vless_uuid   = sys.argv[4]
-trojan_pwd   = sys.argv[5]
-token_dict = {
-    'ip':   landing_ip,
-    'dom':  landing_dom,
-    'port': landing_port,
-    'uuid': vless_uuid,
-    'pwd':  trojan_pwd,
-    'pfx':  vless_uuid[:8],
-}
+lines = [l.strip() for l in sys.stdin.read().split('\n') if l.strip()]
+landing_ip = lines[0]; landing_dom = lines[1]; landing_port = int(lines[2])
+vless_uuid = lines[3]; trojan_pwd = lines[4]
+token_dict = {'ip': landing_ip, 'dom': landing_dom, 'port': landing_port, 'uuid': vless_uuid, 'pwd': trojan_pwd, 'pfx': vless_uuid[:8]}
 print(base64.b64encode(json.dumps(token_dict, separators=(',',':')).encode()).decode())
-TOKPY
-) || { warn "token 生成异常: ${token}"; token=""; }
+" 2>&1) || { warn "token 生成异常: ${token}"; token=""; }
 
   echo ""
   echo -e "${BOLD}${GREEN}"
@@ -2635,6 +2611,7 @@ fresh_install(){
     _headless=1
     DOMAIN="${LANDING_AUTO_DOMAIN:-${DOMAIN:-}}"
     CF_TOKEN="${LANDING_AUTO_CF_TOKEN:-${CF_TOKEN:-}}"
+
     PASS="${LANDING_AUTO_PASSWORD:-${PASS:-}}"
     TRANSIT_IP="${LANDING_AUTO_TRANSIT_IP:-${TRANSIT_IP:-}}"
     LANDING_PORT="${LANDING_AUTO_PORT:-8443}"
