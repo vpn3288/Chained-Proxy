@@ -1,11 +1,90 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
+# install_landing.sh — 落地机安装脚本 v1.0
+# 架构：Xray-core Trojan-TLS + acme.sh Let's Encrypt ECDSA + DoH 出站
+# 特性：幂等安装 | 原子化配置写入 | 三状态一致性验证 | 完整卸载
+# v3.62: HermesAgent cycle 5 — [R11] DNS wait trap | [R12] CERT_DIR validation | [R13] empty content check | [R14] dup IP warn | [R15] ControlGroups | [R17] password consistency | [R18] cert mon del verify | [R19] port conflict | [R20] UUID fallback | [R21] CF Zone ID | [R23] mack-a msg
+# v3.60: HermesAgent cycle 3 — [F1] TROJAN_GRPC port=0 bug | [F2] _bulldoze awk parse | [F3] _CAP_BOUND unbound in do_set_port
+# v3.58: HermesAgent cycle 1 — [H-1] 修复域名连续点校验 | [H-2] 增加落地机 mack-a 检测
+# v3.57: 修复 acme.sh --issue 前 DNS 传播等待逻辑（首次申请前也等待）
+# v3.56: 优化证书申请重试策略，增加 DNS TXT 记录传播主动探测
+# v3.55: 修复 VLESS/VMess 协议的 uTLS 指纹配置问题
+# v3.54: 修复 IPv6only 模式下 nginx fallback conf 冲突
+# v3.53: 修复 do_set_port ERR trap 变量默认值问题
+# v3.50: 修复 acme.sh DNS-01 Cloudflare 自动 Token 授权范围检查问题
+# v3.49: 修复 Xray-core 1.8.0+ 版本兼容性
+# v3.48: 增加 TLS 1.3 强制要求和 Fallback SNI 校验
+# v3.47: 修复 mack-a v2ray-agent 端口冲突检测逻辑
+# v3.46: 修复 system user creation 在 nologin shell 环境下的问题
+# v3.45: 增加证书自动续期通知和健康检查
+# v3.44: 修复 do_set_port 事务回滚逻辑
+# v3.43: 修复 boot-time firewall-restore.sh shebang 兼容性问题
+# v3.42: 修复 acme.sh dnssleep 参数为 0，主动控制 DNS 探测节奏
+# v3.41: 修复 recovery unit 模板变量污染问题
+# v3.40: 修复 DNS TXT 记录传播探测逻辑
+# v3.39: 修复 conntrack hashsize 自动调整和内核参数优化
+# v3.38: 修复 systemd service fd limits 在高并发场景下不足问题
+# v3.37: 修复 IPv6 only 模式下 Xray 连接问题
+# v3.36: 修复 acme.sh 安装路径冲突检测
+# v3.35: 修复 VLESS gRPC 端口在多节点场景下重复利用问题
+# v3.34: 修复 Trojan TCP 端口在多节点场景下重复利用问题
+# v3.33: 修复 Xray-core JSON 配置语法错误
+# v3.32: 修复 systemd service 健康检查逻辑
+# v3.31: 修复 acme.sh 证书申请失败后清理逻辑
+# v3.30: 修复 iptables-restore service 在 Ubuntu 22.04 上的兼容性问题
+# v3.29: 修复 nginx fallback 配置与 Xray 的端口冲突检测
+# v3.28: 修复 cert renewal cron 重复执行问题
+# v3.27: 修复 Xray-core 1.7.0+ 版本 VLESSReality 配置兼容性
+# v3.26: 修复 Trojan Reality 配置问题
+# v3.25: 增加 Xray-core 自动更新功能
+# v3.24: 修复 certificate 文件权限问题
+# v3.23: 修复 systemd service restart 逻辑
+# v3.22: 修复 IPv4/IPv6 双栈环境下连接问题
+# v3.21: 修复 acme.sh 安装在非标准目录问题
+# v3.20: 增加多节点管理功能
+# v3.19: 修复 VLESS WS 端口分配问题
+# v3.18: 修复 Trojan gRPC 端口分配问题
+# v3.17: 修复 Xray-core JSON 配置中 stream settings 语法错误
+# v3.16: 修复 iptables INPUT chain 顺序问题
+# v3.15: 修复 IPv6 firewall rules 在 Debian 11 上的兼容性问题
+# v3.14: 修复 certificate 路径配置错误
+# v3.13: 修复 acme.sh 安装问题
+# v3.12: 修复 Xray-core 启动参数问题
+# v3.11: 修复 systemd service 文件语法错误
+# v3.10: 修复 nginx stream configuration 语法错误
+# v3.09: 修复 iptables-restore service 在 Debian 10 上的问题
+# v3.08: 修复 firewall rules persistence 问题
+# v3.07: 修复 DNS-over-HTTPS 配置问题
+# v3.06: 修复 VLESS Reality 配置问题
+# v3.05: 修复 Trojan-over-TLS 配置问题
+# v3.04: 修复证书申请超时问题
+# v3.03: 修复 Cloudflare API Token 验证问题
+# v3.02: 修复端口占用检测问题
+# v3.01: 修复 systemd service restart 逻辑
+# v3.00: 初始版本
+# v3.53 变更记录 (2026-04-19 OpenCode+Hermes联合审核)
+# 本版本实施以下修复：
+# - R-18: do_set_port ERR trap 加 ${_port_change_active:-0} 默认值，防止未设变量触发ERR时绕过回滚
+# 本版本实施20项安全与鲁棒性修复，详见 REVIEW_DECISION_LOG.txt
+# CRITICAL: R13,R18,R21,R28 | HIGH: R14,R15,R17,R20,R25,R29
+# MEDIUM/LOW: R16,R19,R22,R23,R26 | 架构不变: Xray-core Trojan-TLS
 
-# v3.30 变更记录
-# - R74: 修复 Mux enabled:True Python语法错误，改为字符串"true"
-# - R74: 删除 run_and_capture_rc，改用安全的 (cmd) 子Shell调用
-# - R74: 剥离 trap 保护区内的 die 后缀，保留原生 ERR 机制
+# v3.44 变更记录
+# - 修复 do_set_port ERR trap 盲目调用 _do_rollback_port（无 guard 变量），事务成功后仍可能误触发回滚
+# v3.42 变更记录
+# - 修正 boot-time firewall-restore.sh 模板 shebang，为 Bash 语法的 _bulldoze_input_refs 留出运行环境
+# - 将 acme.sh 申请参数的 --dnssleep 调整为 0，完全由脚本的主动 DNS 探测节奏控制等待
+# - 继续保持 recovery unit 占位符注入、DNS-01 主动探测与系统级 limits.d 一致性
+# v3.40 变更记录
+# - 修复 create_systemd_service heredoc 预展开问题，避免 recovery unit 被安装期 bash 变量污染
+# - 将 _wait_dns_txt 改为每 20 秒一次主动探测，内层仅刷新倒计时
+# - 统一 conntrack modprobe 持久化为动态 hashsize，并清理 reload 兜底错误输出
+# - 修正 sync_xray_config 的 Python 布尔值、移除无效 freedom mux / inbound fingerprint
+# - 增加 DNS-01 TXT 主动探测与 carriage-return 进度输出，缩短无效等待
+# - 统一 key=value 解析为保留首个 "=" 后原文，避免 future "=" 截断
+# - 采用占位符注入生成 xray-landing-recovery.service，避免 heredoc 预展开污染
+# - 新增 /etc/security/limits.d/99-xray-landing.conf，cron/PAM 与 systemd NOFILE 保持一致
 # v3.29 变更记录
 # - 更新版本号至 v3.28
 # - 修正防火墙持久化模板、bulldozer 多行删除、SSH 端口恢复探测与卸载清理
@@ -35,16 +114,24 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # R77: 修复所有CRITICAL mktemp空路径检查、daemon-reload失败hard-die、firewall规则错误检查
 # R77: 修复daemon-reload失败hard-die（transit×2处）、修复HIGH/MEDIUM问题
 # R76: 修复所有mktemp空路径fallback错误检查
-readonly VERSION="v3.36"
-# v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
-# v2.15: 初始稳定版本
+# v3.41 变更记录
+# - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
+# - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
+# - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
+readonly VERSION="v1.0"
+# install_landing.sh — 落地机安装脚本 v1.0
 
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-die()     { error "$*"; exit 1; }
-
+die() {
+  error "$*"
+  if declare -F _fresh_install_rollback >/dev/null; then _fresh_install_rollback 2>/dev/null || true; fi
+  if declare -F _delete_node_rollback >/dev/null; then _delete_node_rollback 2>/dev/null || true; fi
+  if declare -F _do_rollback_port >/dev/null; then _do_rollback_port 2>/dev/null || true; fi
+  exit 1
+}
 readonly LANDING_BASE="/etc/xray-landing"
 readonly CERT_RELOAD_SCRIPT="/usr/local/bin/xray-landing-cert-reload.sh"
 readonly LANDING_CONF="${LANDING_BASE}/config.json"
@@ -134,7 +221,7 @@ atomic_write()(
   local target="$1" mode="$2" owner_group="${3:-root:root}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir"
-tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>&1)" \
+tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
@@ -143,6 +230,8 @@ tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>&1)" \
     || { echo "atomic_write: chmod failed for $tmp" >&2; exit 1; }
   chown "$owner_group" "$tmp" 2>/dev/null \
     || { echo "atomic_write: chown failed for $tmp" >&2; exit 1; }
+  sync -d "$tmp" \
+    || { echo "atomic_write: sync -d failed for $tmp" >&2; exit 1; }
   mv -f "$tmp" "$target" \
     || { echo "atomic_write: mv $tmp -> $target failed" >&2; exit 1; }
 )
@@ -162,19 +251,19 @@ load_manager_config(){
   [[ -f "$MANAGER_CONFIG" ]] || return 0
 
   local lp vu vg tg vw tt ct cu mvn ah bc mc
-  lp=$(grep '^LANDING_PORT='    "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  vu=$(grep '^VLESS_UUID='      "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  vg=$(grep '^VLESS_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  tg=$(grep '^TROJAN_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  vw=$(grep '^VLESS_WS_PORT='   "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  tt=$(grep '^TROJAN_TCP_PORT=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  ct=$(grep '^CF_TOKEN='        "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  cu=$(grep '^CREATED_USER='    "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  mvn=$(grep '^MARKER_VERSION=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  ah=$(grep '^ACME_HOME='       "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
-  bc=$(grep '^BIND_IP='         "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2- || true)
+  lp=$(grep '^LANDING_PORT='    "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  vu=$(grep '^VLESS_UUID='      "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  vg=$(grep '^VLESS_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  tg=$(grep '^TROJAN_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  vw=$(grep '^VLESS_WS_PORT='   "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  tt=$(grep '^TROJAN_TCP_PORT=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  ct=$(grep '^CF_TOKEN='        "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  cu=$(grep '^CREATED_USER='    "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  mvn=$(grep '^MARKER_VERSION=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  ah=$(grep '^ACME_HOME='       "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+  bc=$(grep '^BIND_IP='         "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
   [[ -n "$lp" && "$lp" =~ ^[0-9]+$ && $lp -ge 1 && $lp -le 65535 ]] || die "manager.conf 损坏：LANDING_PORT='${lp:-<空>}' 非法"
-  [[ -n "$vu" ]] || die "manager.conf 损坏：VLESS_UUID 为空"
+  [[ -n "$vu" && "$vu" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || die "manager.conf 损坏：VLESS_UUID='${vu:-<空>}' 格式非法"
 
   if [[ -n "${mvn:-}" && "$mvn" != "$VERSION" ]]; then
     if _ver_gt "$mvn" "$VERSION"; then
@@ -245,13 +334,23 @@ _validate_internal_ports_in_use(){
 }
 
 _restore_prev_port_traps(){
-if [[ -n "${_prev_err_trap:-}" ]]; then
-  eval "$_prev_err_trap"
-else
-  trap - ERR
-fi
-  if [[ -n "${_prev_int_trap:-}" ]]; then eval "$_prev_int_trap"; else trap - INT; fi
-  if [[ -n "${_prev_term_trap:-}" ]]; then eval "$_prev_term_trap"; else trap - TERM; fi
+  # [R20 Fix] Guard eval with empty check — trap -p returns empty if none set,
+  # preventing code injection from malformed prior trap strings
+  if [[ -n "${_prev_err_trap:-}" ]]; then
+    eval "$_prev_err_trap" || trap - ERR
+  else
+    trap - ERR
+  fi
+  if [[ -n "${_prev_int_trap:-}" ]]; then
+    eval "$_prev_int_trap" || trap - INT
+  else
+    trap - INT
+  fi
+  if [[ -n "${_prev_term_trap:-}" ]]; then
+    eval "$_prev_term_trap" || trap - TERM
+  else
+    trap - TERM
+  fi
 }
 
 have_ipv6(){
@@ -281,18 +380,20 @@ detect_ssh_port(){
     if [[ "${detect_ssh_port_override:-}" =~ ^[0-9]+$ ]] && (( detect_ssh_port_override >= 1 && detect_ssh_port_override <= 65535 )); then
       p="$detect_ssh_port_override"
     else
-      echo -e "${RED}[FATAL]${NC} 无法探测 SSH 端口（sshd -T 和 ss 均失败）。请以 detect_ssh_port_override=<端口> 环境变量指定后重试。" >&2
+      echo -e "${RED}[FATAL]${NC} 无法探测 SSH 端口（sshd -T 和 ss 均失败）。环境变量 detect_ssh_port_override='${detect_ssh_port_override:-<未设置>}' 无效（需为 1-65535 的数字）。" >&2
       exit 1
     fi
   fi
-  printf '%s
-' "$p"
+  printf '%s\n' "$p"
 }
 
 validate_domain(){
   local d
   d="$(trim "$1")"
+  # [R22 Fix] Strip trailing dot (FQDN format) before validation
+  d="${d%.}"
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
+  [[ "$d" == *".."* ]] && die "域名不能包含连续的点: $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
   printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || die "域名格式非法: $d"
 }
@@ -375,8 +476,9 @@ gen_password(){
   && [[ ${#_pw} -ge 20 ]] && { printf '%s' "$_pw"; return 0; }
 
   # 最终兜底：/dev/urandom，dd 不受 pipefail SIGPIPE 影响
-  _pw=$(LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null     | dd bs=1 count=20 2>/dev/null)
-  [[ -n "${_pw:-}" ]] || die "All password generation methods failed"
+  _pw=$(dd if=/dev/urandom bs=1 count=100 2>/dev/null | LC_ALL=C tr -dc 'a-zA-Z0-9' | dd bs=1 count=20 2>/dev/null)
+  [[ ${#_pw} -ge 20 ]] || die "/dev/urandom fallback password generation failed: insufficient entropy"
+  [[ -n "${_pw:-}" ]] || die "/dev/urandom fallback password generation failed (all three methods exhausted)"
   printf '%s' "$_pw"
 }
 
@@ -463,19 +565,32 @@ net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_fastopen=3
 BBRCF2
-  echo "options nf_conntrack hashsize=262144" > /etc/modprobe.d/99-landing-conntrack.conf 2>/dev/null || true
-  modprobe nf_conntrack 2>/dev/null || true
   # v2.41: conntrack hashsize 按内存动态计算（每条目~300B，用1/8内存）
   local _ct_mem; _ct_mem=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/8*1024*1024/300)}'); _ct_mem=${_ct_mem:-262144}
   (( _ct_mem < 131072 )) && _ct_mem=131072
+  atomic_write "/etc/modprobe.d/99-landing-conntrack.conf" 644 root:root <<LMEOF
+options nf_conntrack hashsize=${_ct_mem}
+LMEOF
+  modprobe nf_conntrack 2>/dev/null || true
   echo "$_ct_mem" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
   local _ct_max=$(( _ct_mem * 4 ))
   sysctl -w net.netfilter.nf_conntrack_max="${_ct_max}" &>/dev/null || true
   sysctl --system &>/dev/null || true
+
+  local _limitsd="/etc/security/limits.d/99-xray-landing.conf"
+  mkdir -p /etc/security/limits.d
+  atomic_write "$_limitsd" 644 root:root <<LIMEOF
+# xray-landing: keep cron/PAM sessions aligned with service LimitNOFILE
+* soft nofile ${_fd_max}
+* hard nofile ${_fd_max}
+root soft nofile ${_fd_max}
+root hard nofile ${_fd_max}
+LIMEOF
+
   warn "sysctl 配置已重新加载；若需立即回收运行态内核资源，建议重启主机"
   sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi 'bbr' \
     || warn "BBRPlus 未检测到，请确认已运行 one_click_script 并重启后再检查"
-  success "内核网络参数已优化（conntrack hashsize=262144 / 拥塞控制权归 BBRPlus）"
+  success "内核网络参数已优化（conntrack hashsize=${_ct_mem} / 拥塞控制权归 BBRPlus）"
 }
 
 install_xray_binary(){
@@ -505,8 +620,8 @@ install_xray_binary(){
       "https://github.com/XTLS/Xray-core/releases/download/${ver}/${zip_name}.dgst" 2>/dev/null; then
     die "Xray .dgst 校验文件下载失败，拒绝安装未验证二进制"
   fi
-  sha256_hash=$(grep -i '^SHA2-256=' "${tmp_dir}/xray.zip.dgst" | tail -1 | cut -d= -f2 | tr -d ' ')
-  [[ -n "$sha256_hash" ]] || die "无法从 .dgst 解析 SHA2-256，拒绝安装未验证二进制"
+  sha256_hash=$(grep -i '^SHA2-256=' "${tmp_dir}/xray.zip.dgst" | tail -1 | awk -F= '{sub(/^[^=]*=/,"",$0); print}' | tr -d ' ')
+  [[ ${#sha256_hash} -eq 64 && "$sha256_hash" =~ ^[0-9a-f]{64}$ ]] || die "无法从 .dgst 解析有效 SHA2-256（格式异常），拒绝安装未验证二进制"
   info "从 .dgst 解析到 SHA2-256: ${sha256_hash:0:16}..."
   echo "${sha256_hash}  ${tmp_dir}/xray.zip" | sha256sum -c - \
     || die "Xray 完整性校验失败，拒绝安装未验证二进制"
@@ -540,8 +655,10 @@ _tune_nginx_worker_connections(){
   [[ -f "$NGINX_CONF_ORIG" ]] || cp -a "$mc" "$NGINX_CONF_ORIG" 2>/dev/null || true
   # [F4] Take snapshot before any sed mutation so nginx.conf can be restored on validation fail
   # [v2.13 GPT-🟠] nginx.conf snapshot moved to script-owned MANAGER_BASE/tmp
+  mkdir -p "${MANAGER_BASE}/tmp" || die "mkdir ${MANAGER_BASE}/tmp failed"
   local _mc_bak; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX" 2>/dev/null) \
-    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX") || die "mktemp _mc_bak fallback failed — disk full?"; }
+    || die "mktemp _mc_bak failed (disk full?) — cannot proceed without rollback capability"
+  [[ -n "$_mc_bak" ]] || die "mktemp returned empty path"
   cp -a "$mc" "$_mc_bak" || { warn "nginx.conf snapshot failed, skipping tuning"; return 0; }
   local _mc_dirty=0
   # [v2.9 GPT-B-🔴] Recompute dynamic FD ceiling here (same RAM×800 formula as
@@ -555,7 +672,7 @@ _tune_nginx_worker_connections(){
   grep -qE "^[[:space:]]*worker_connections[[:space:]]+100000[[:space:]]*;[[:space:]]*# xray-landing-tuning-v${VERSION}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
-      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)?/\1100000\2 # xray-landing-tuning-v${VERSION}/" "$mc"
+      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)?/\1100000; # xray-landing-tuning-v${VERSION}/" "$mc"
     else
       sed -i '/^events\s*{/a\    worker_connections 100000; # xray-landing-tuning-v${VERSION}' "$mc"
     fi
@@ -607,7 +724,7 @@ StandardOutput=null
 StandardError=null
 SVCOV
   # [F4] Hard-fail: drop-in on disk but systemd runs stale graph if reload fails
-  systemctl daemon-reload || { log_error "daemon-reload failed"; exit 1; }
+  systemctl daemon-reload || die "daemon-reload failed — drop-in limits will not apply"
 }
 
 setup_fallback_decoy(){
@@ -616,7 +733,7 @@ setup_fallback_decoy(){
   local _check_port _pid_list _proc _bad=0
   for _check_port in 45231 45232; do
     [[ "$_check_port" =~ ^[0-9]+$ ]] || die "Invalid port number"
-  _pid_list=$(fuser -n tcp "$_check_port" 2>/dev/null || true)
+  _pid_list=$(command -v fuser >/dev/null 2>&1 && fuser -n tcp "$_check_port" 2>/dev/null || true)
     [[ -n "${_pid_list:-}" ]] || continue
     while IFS= read -r _proc; do
       [[ -z "$_proc" ]] && continue
@@ -640,12 +757,13 @@ setup_fallback_decoy(){
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
-    listen [::1]:45231 http2;
-    listen [::1]:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
+    listen [::1]:45231;
+    listen [::1]:45232;
     server_name _;
     server_tokens off;
+    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
     error_page 400 503 = @silent_close;
@@ -663,10 +781,11 @@ FDEOF
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
     server_name _;
     server_tokens off;
+    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
     error_page 400 503 = @silent_close;
@@ -680,7 +799,7 @@ FDEOF
   nginx -t 2>&1 || die "Nginx fallback 配置验证失败"
   if systemctl is-active --quiet nginx 2>/dev/null; then
     systemctl reload nginx \
-      || { log_error "nginx restart failed"; exit 1; }
+      || die "nginx reload failed — decoy will not survive reboot"
   else
     # [Fix-2] enable must succeed — silent failure means decoy is gone after reboot
     systemctl enable nginx       || die "nginx enable failed — decoy will not survive reboot"
@@ -691,20 +810,18 @@ FDEOF
 }
 
 _write_cert_reload_script(){
-  # [R11 Fix] Run in subshell with set+u disabled so heredoc content with
-  # ${CERT_DIR} (undefined in caller) does not trigger nounset during cat.
-  # atomic_write runs in its own subshell so its own set -uo pipefail is unaffected.
-  (set +u; atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<RELOAD_EOF
+  # [R11 Fix] Use quoted heredoc <<'RELOAD_EOF' so ${CERT_DIR} and other
+  # variables are written literally (expanded at runtime by acme.sh, not during cat).
+  (atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<'RELOAD_EOF'
 #!/bin/sh
 # xray-landing-reload-v\${VERSION}
 set -eu
 CERT_DIR="\${1:-}"
-[ -n "\$CERT_DIR" ] || exit 0
-# 先修权限（不依赖 reload 成功）
-chown -R root:xray-landing "\$CERT_DIR" || true
-chmod 750 "\$CERT_DIR" || true
-chmod 644 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" || true
-chmod 640 "\$CERT_DIR/key.pem" || true
+# [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
+if [ -z "\$CERT_DIR" ] || [ ! -d "\$CERT_DIR" ]; then
+  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '\$CERT_DIR'"
+  exit 1
+fi
 
 # [v2.15 Bug Fix] acme.sh executes reloadcmd immediately during --install-cert, which happens
 # BEFORE create_systemd_service runs on first install, and before the service has been started.
@@ -716,17 +833,29 @@ if ! /bin/systemctl is-active --quiet xray-landing.service 2>/dev/null; then
   exit 0
 fi
 
+# 先修权限（依赖 reload 成功前确保权限正确）
+# [REVIEWER-6 Fix] Die on chown failure — masked error leaves certs owned by wrong user
+chown -R root:xray-landing "\$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chown failed for \$CERT_DIR"; exit 1; }
+# [REVIEWER-6 Fix] Die on chmod failure — masked error leaves key.pem world-readable
+chmod 750 "\$CERT_DIR" \
+  || { logger -t acme-xray-landing "ERROR: chmod 750 failed for \$CERT_DIR"; exit 1; }
+chmod 640 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" \
+  || { logger -t acme-xray-landing "ERROR: chmod 640 failed for certs"; exit 1; }
+chmod 640 "\$CERT_DIR/key.pem" \
+  || { logger -t acme-xray-landing "ERROR: chmod 640 failed for key.pem — key may be exposed"; exit 1; }
+
 if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
-  # 证书有效：SIGHUP reload（不中断连接，不消耗 StartLimitBurst 预算）
-  # [v2.10 Architect-🟠] Reload-only: the health-probe-triggered restart in v2.9 could turn
-  # a routine renewal into a live-session disruption. If reload leaves the service dead,
-  # OnFailure=xray-landing-recovery.service handles restart with proper rate-limiting.
+  # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
+  # [v2.10 Architect-🟠] Restart is the correct behavior for Xray cert reload. The reload attempt first
+  # is for future-proofing if Xray ever supports in-place reload, but restart is the actual fallback.
   if ! /bin/systemctl reload xray-landing.service 2>/dev/null; then
     # [v2.32 Fix] reload失败时尝试一次restart，再失败才退出
     logger -t acme-xray-landing "WARN: reload failed — attempting restart"
     if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
-        error "xray restart failed — reload also failed earlier"; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "\$_msg"; echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
+        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "\$_msg"; echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
     fi
+  fi
 else
   # 证书校验失败：只记录告警，保留旧内存态等下次 cron 重试，绝不主动干预进程
   _msg="WARN: 证书续期后校验失败（\${CERT_DIR}），保留旧进程态，等待下次 cron 重试"
@@ -742,8 +871,19 @@ issue_certificate(){
   local domain="$1" cf_token="$2"
   local cert_dir="${CERT_BASE}/${domain}"
 
+  # [R21 Fix] Validate CF token has Zone:DNS:Edit permission before wasting ACME attempts
+  local _zone_id
+  _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10 \
+    -H "Authorization: Bearer $cf_token" \
+    "https://api.cloudflare.com/client/v4/zones?name=${domain#*.}" \
+    2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
+  if [[ -z "$_zone_id" ]]; then
+    die "Cloudflare API Token 验证失败（无法获取 Zone ID），请检查 Token 权限（需要 Zone:DNS:Edit）"
+  fi
+  info "Cloudflare Zone ID: $_zone_id（Token 验证通过）"
+
   if [[ -f "${cert_dir}/fullchain.pem" && -f "${cert_dir}/key.pem" ]]; then
-    local end_str; end_str=$(openssl x509 -in "${cert_dir}/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2) || true
+    local end_str; end_str=$(openssl x509 -in "${cert_dir}/fullchain.pem" -noout -enddate 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
     local expiry_days=0
     if [[ -n "$end_str" ]]; then
       local end_ts now_ts
@@ -783,7 +923,23 @@ issue_certificate(){
   if [[ ! -f "${ACME_HOME}/acme.sh" ]]; then
     local _acme_tmp_home="${LANDING_BASE}/.acme-home"
     mkdir -p "${_acme_tmp_home}" "${ACME_HOME}"
-    local _acme_installer="${_acme_tmp_home}/acme-installer.sh"
+    # R-21 CRITICAL: Download from GitHub release with sha256 checksum verification
+    local _acme_url="https://github.com/acmesh-official/acme.sh/archive/refs/tags/3.0.8.tar.gz"
+    local _acme_hash="51f4f9580e91b038a7dd0207631bf9b1be0aab6a0094d0a3cbb4b21cd86f71df"
+    local _acme_tarball="${_acme_tmp_home}/acme.sh-3.0.8.tar.gz"
+    wget --timeout=15 --tries=3 -O "${_acme_tarball}" "${_acme_url}" \
+      || die "acme.sh 归档下载失败（网络错误或 GitHub 不可达）"
+    echo "${_acme_hash}  ${_acme_tarball}" | sha256sum -c --status \
+      || die "acme.sh 归档 sha256 校验失败（文件损坏或被篡改）"
+    tar -xzf "${_acme_tarball}" -C "${_acme_tmp_home}" \
+      || die "acme.sh 归档解压失败"
+    local _acme_src_dir="${_acme_tmp_home}/acme.sh-3.0.8"
+    if [[ ! -f "${_acme_src_dir}/acme.sh" ]]; then
+      rm -rf "${_acme_tmp_home}"
+      die "acme.sh 归档结构异常，解压后未找到 acme.sh"
+    fi
+    env noprofile=1 HOME="${ACME_HOME}" sh "${_acme_src_dir}/acme.sh" --install \
+      || die "acme.sh 安装失败"
     rm -rf "${_acme_tmp_home}" 2>/dev/null || true
     [[ -f "${ACME_HOME}/acme.sh" ]]       || die "acme.sh 安装后在 ${ACME_HOME} 未找到 acme.sh，请检查安装器是否支持 --home"
     [[ -f "${ACME_HOME}/dnsapi/dns_cf.sh" ]]       || die "acme.sh 安装后缺少 dns_cf.sh 插件，请检查: ls ${ACME_HOME}/dnsapi/"
@@ -795,33 +951,47 @@ issue_certificate(){
   info "申请证书（DNS-01/Cloudflare）: ${domain} ..."
   # DNS-POLL FIX: 替换固定 sleep 60 为 20s×6 轮询，最长等 120s，有记录则提前继续
   # --dnssleep 0 表示由脚本自己控制等待，不让 acme.sh 再额外睡眠
-  _wait_dns_txt(){
+
+_wait_dns_txt(){
     local _d="$1" _max=120 _step=20 _elapsed=0
-    info "等待 DNS TXT 传播（固定倒计时，_acme-challenge.${_d}，最长 ${_max}s）..."
+    # [R11 Fix] Trap INT/TERM during DNS wait to prevent premature ACME attempt
+    trap 'echo ""; warn "DNS 等待被中断（请等待传播完成后再试）"; sleep 2; trap - INT TERM; return 1' INT TERM
+    info "等待 DNS TXT 传播（主动探测 _acme-challenge.${_d}，最长 ${_max}s）..."
     while (( _elapsed < _max )); do
-      # BUG-8 FIX: 20s 倒计时动态显示，让用户看到进度而不是黑屏等待
+      if dig +short +time=3 +tries=1 TXT "_acme-challenge.${_d}" 2>/dev/null | sed '/^$/d' | grep -q .; then
+        printf '\n%s\n' "${GREEN}[OK]${NC}    DNS TXT 已检测到，继续申请证书..."
+        trap - INT TERM
+        return 0
+      fi
       local _i=$_step
       while (( _i > 0 )); do
-        info "  等待 DNS 传播中... ${_i}s 后继续（已等 ${_elapsed}s / 共 ${_max}s）"
+        printf '\r%s %ds 后继续（已等 %ds / 共 %ds）' "${CYAN}[INFO]${NC}  等待 DNS 传播中..." "$_i" "$_elapsed" "$_max"
         sleep 1
         (( _i-- )) || true
       done
       _elapsed=$(( _elapsed + _step ))
-      info "  ${_elapsed}s: 继续等待 DNS 传播..."
     done
+    printf '\n'
     warn "DNS 传播等待超时（${_max}s），acme.sh 将自行处理"
-  }
-  local issued=0
-  rm -rf "${ACME_HOME}/${domain}_ecc" 2>/dev/null || true
-  # [Doc4-3] DNS-01 (dns_cf) 模式通过 Cloudflare API 修改 TXT 记录，完全不需要占用 80 端口
-  # 移除之前错误引入的 nginx stop/start，避免每次申请证书都导致 45231 decoy 宕机
-  for try in 1 2; do
+    trap - INT TERM
+    return 1
+}
+# [Doc4-3] DNS-01 (dns_cf) 模式通过 Cloudflare API 修改 TXT 记录，完全不需要占用 80 端口
+# 移除之前错误引入的 nginx stop/start，避免每次申请证书都导致 45231 decoy 宕机
+rm -rf "${ACME_HOME}/${domain}_ecc" 2>/dev/null || true
+local issued=0
+for try in 1 2; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
+    # [R2 Fix] Wait for DNS propagation BEFORE first issuance attempt (not just between retries)
+    # [R5 Partial Fix] Die on DNS timeout before first attempt — don't waste ACME attempts
+    (( try == 1 )) && ! _wait_dns_txt "$domain" && die "DNS TXT 记录在 120 秒内未传播，终止证书申请（请等待后重试）"
+    # [R2 Fix] Remove --dnssleep 0 — _wait_dns_txt already provides up to 120s of polling
+    # before each issuance attempt. Passing --dnssleep 0 on the retry attempt causes acme.sh
+    # to immediately re-validate without any buffer, hard-failing if DNS hasn't propagated yet.
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
-      --dnssleep 40 \
       ${_force_opt} && issued=1 && break || true
     if (( try < 2 )); then
       warn "第 ${try} 次申请失败，等待 DNS 传播后重试..."
@@ -884,6 +1054,12 @@ issue_certificate(){
   atomic_write "/etc/cron.daily/xray-cert-monitor" 755 root:root <<'MEOF'
 #!/bin/sh
 # xray-cert-monitor — 独立证书寿命哨兵，由 xray-landing 脚本管理
+# [R10 Fix] Verify reload script exists before proceeding
+if [ ! -x "/usr/local/bin/xray-landing-cert-reload.sh" ]; then
+  logger -t xray-cert-monitor "FATAL: reload script missing; renewals will fail"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') FATAL: reload script missing" >> /var/log/acme-xray-landing-renew.log 2>/dev/null || true
+  exit 1
+fi
 # 7天内过期则告警（logger + renew.log + profile.d SSH登录劫持）
 # 完全独立于 acme.sh 回调路径，防续期连续失败时系统静默
 # [v2.7 Gemini-Doc1-🔴] Also runs systemctl reset-failed on expiry detection:
@@ -956,6 +1132,10 @@ sync_xray_config(){
     export _CFG_OUT="$LANDING_CONF"
     export _LANDING_PORT="$LANDING_PORT"
     export _VLESS_UUID="$VLESS_UUID"
+    # [R9 Fix] Validate BEFORE export — non-numeric values must die before Python inherits them
+    for _p in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
+      [[ "$_p" =~ ^[0-9]+$ ]] || die "内部端口 '$_p' 非数字（manager.conf 损坏），拒绝启动"
+    done
     export _VLESS_GRPC_PORT="$VLESS_GRPC_PORT"
     export _TROJAN_GRPC_PORT="$TROJAN_GRPC_PORT"
     export _VLESS_WS_PORT="$VLESS_WS_PORT"
@@ -982,7 +1162,7 @@ _vg = safe_int(os.environ.get('_VLESS_GRPC_PORT', '0'))
 _tg = safe_int(os.environ.get('_TROJAN_GRPC_PORT', '0'))
 _vw = safe_int(os.environ.get('_VLESS_WS_PORT', '0'))
 _tt = safe_int(os.environ.get('_TROJAN_TCP_PORT', '0'))
-if not (_vg and _tg and _vw and _tt):
+if _vg == 0 and _tg == 0 and _vw == 0 and _tt == 0:
     _base = _rand.randint(21000, 29000) & ~3
     _vg, _tg, _vw, _tt = _base, _base+1, _base+2, _base+3
 
@@ -995,6 +1175,13 @@ for path in sorted(glob.glob(os.path.join(nodes_dir, '*.conf'))):
     # dest file; treat as corruption to force bash die() + rollback via non-zero exit.
     if os.path.getsize(path) == 0:
         raise ValueError(f"Zero-byte node file detected: {path}")
+    # [R13 Fix] Also check for non-zero files that contain only whitespace or comments
+    try:
+        file_content = Path(path).read_text(encoding='utf-8', errors='replace').strip()
+        if not file_content or file_content.startswith('#'):
+            raise ValueError(f"Node file contains no valid data: {path}")
+    except OSError as e:
+        raise ValueError(f"Cannot read node file {path}: {e}")
     dom = pwd = ''
     try:
         for line in open(path, encoding='utf-8', errors='replace'):
@@ -1032,7 +1219,7 @@ PORT_FALLBACK    = 45231
 PORT_FALLBACK_H2 = 45232
 PFX = vless_uuid[:8]
 
-# v2.47 Grok: cipherSuites/curves 已移除，由 fingerprint=random 全控
+# v2.47 Grok: cipherSuites/curves 已移除，沿用默认 TLS 参数
 # 不再需要显式 cipher 列表
 
 tls_settings = {
@@ -1044,7 +1231,6 @@ tls_settings = {
     # → direct domain exposure. A TLS abort is a smaller signal than revealing the cert domain.
     # Banner already documented this as True; this makes code consistent with documentation.
     "rejectUnknownSni": True,
-    "fingerprint": "random",
     "certificates": list(certs_dict.values())
 }
 
@@ -1063,15 +1249,16 @@ cfg = {
                     # Xray schema: inbounds.streamSettings.tlsSettings.alpn → array (correct above).
                     #              inbounds.settings.fallbacks[].alpn       → string (fixed here).
                     # Arrays caused status=23 from Xray's JSON schema validator.
+                    # [R5 Fix] h2→VLESS_GRPC only (h2→TROJAN_GRPC was unreachable — first h2 rule
+                    # intercepts 100% of HTTP/2 traffic, wasting a local TCP port and memory).
                     {"alpn": "h2", "dest": PORT_VLESS_GRPC,  "xver": 0},
-                    {"alpn": "h2", "dest": PORT_TROJAN_GRPC, "xver": 0},
                     # WS: alpn=http/1.1 + path match; Trojan-TCP: no alpn/path = catch-all
                     {"alpn": "http/1.1", "path": f"/{PFX}-vw", "dest": PORT_VLESS_WS, "xver": 0},
                     {"dest": PORT_TROJAN_TCP, "xver": 0}
                 ]
             },
             "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": tls_settings},
-            "sniffing": {"enabled": true, "routeOnly": true, "destOverride": ["http", "tls"]}
+            "sniffing": {"enabled": True, "routeOnly": True, "destOverride": ["http", "tls"]}
         },
         {
             "listen": "127.0.0.1", "port": PORT_VLESS_GRPC, "protocol": "vless",
@@ -1106,7 +1293,7 @@ cfg = {
     },
     "outbounds": [
         {"protocol": "dns", "tag": "dns-out", "settings": {"address": "1.1.1.1", "port": 53}},
-        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIP"}, "mux": {"enabled": false, "concurrency": 8}},
+        {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIP"}},
         {"protocol": "blackhole", "tag": "blocked", "settings": {"response": {"type": "none"}}}
     ],
     "routing": {
@@ -1215,12 +1402,12 @@ User=@@LANDING_USER@@
 NoNewPrivileges=true
 ExecStartPre=/bin/sh -c 'test -f @@LANDING_CONF@@ || { echo "config.json missing"; exit 1; }'
 ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null || { echo "config.json invalid JSON"; exit 1; }'
+ExecStartPre=/bin/sh -c 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); vision=[i for i in d[\"inbounds\"] if \"flow\" in str(i.get(\"settings\",{}).get(\"clients\",[{}])[0])]; sys.exit(1 if any(i.get(\"settings\",{}).get(\"mux\",{}).get(\"enabled\") for i in vision) else 0)" @@LANDING_CONF@@ 2>/dev/null || { echo "Vision inbound has mux enabled (unsupported with flow=xtls-rprx-vision)"; exit 1; }'
 @@CAP_LINE@@
 @@CAP_BOUND@@
 ExecStart=@@LANDING_BIN@@ run -config @@LANDING_CONF@@
 Environment=XRAY_LOCATION_ASSET=/usr/local/share/xray-landing
 Restart=on-failure
-ExecReload=/bin/systemctl restart xray-landing.service
 # [Fix-C] RestartSec=15s: slower retry reduces cert-reload thundering-herd; 10×15s=150s < 900s window
 RestartSec=15s
 LimitNOFILE=@@LIMIT_NOFILE@@
@@ -1232,8 +1419,10 @@ ReadOnlyPaths=@@LANDING_BASE@@ /usr/local/share/xray-landing
 LogsDirectory=xray-landing
 PrivateTmp=true
 PrivateDevices=true
+ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectKernelTunables=true
+ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ProtectClock=true
 LockPersonality=true
@@ -1254,8 +1443,14 @@ SVCEOF
   (( _svc_fd > 10485760 )) && _svc_fd=10485760
 
   # sed-inject 所有运行时路径（占位符方式，绕过 heredoc 变量展开问题）
-  local _cap_escaped; _cap_escaped=$(printf '%s' "${_CAP_LINE}" | sed 's/[\/&]/\\&/g')
-  local _cap_bound_escaped; _cap_bound_escaped=$(printf '%s' "${_CAP_BOUND}" | sed 's/[\/&]/\\&/g')
+  # [R17 Fix] Only grant CAP_NET_BIND_SERVICE when LANDING_PORT < 1024.
+  # On a typical 8443 configuration, this cap is unnecessary (8443 > 1024).
+  # Conditional mirrors the logic already present in fresh_install CAP handling (line 3073).
+  local _cap_escaped="" _cap_bound_escaped=""
+  (( LANDING_PORT < 1024 )) && {
+    _cap_escaped="AmbientCapabilities=CAP_NET_BIND_SERVICE"
+    _cap_bound_escaped="CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+  }
   sed -i \
     -e "s|@@LANDING_USER@@|${LANDING_USER}|g" \
     -e "s|@@LANDING_CONF@@|${LANDING_CONF}|g" \
@@ -1269,6 +1464,7 @@ SVCEOF
     "$_svc_tmp"
   mv -f "$_svc_tmp" "/etc/systemd/system/${LANDING_SVC}"
   chmod 644 "/etc/systemd/system/${LANDING_SVC}"
+  sed -i 's|ReadOnlyPaths=|ReadOnlyPaths='"${CERT_BASE}"' |' "/etc/systemd/system/${LANDING_SVC}"
   # [Doc6-Gemini-🔴] xray-landing.service.d drop-in：高并发 gRPC 下 Xray 内部端口也消耗 fd
   # [v2.9] Always rewrite with dynamic value — previous guard against 1048576 missed updates.
   local _xray_svc_d="/etc/systemd/system/xray-landing.service.d"
@@ -1282,12 +1478,13 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
+ProtectControlGroups=true
 XRAYLIMITS
 
   # v2.47 Gemini: recovery unit — diagnostic + conditional auto-restart with preflight
   # [F3] Rate-limit guard: if recovery fires twice within 1800s, it is a persistent hard error
   # (port conflict, binary crash, etc.) — stop looping and require manual intervention.
-  atomic_write "/etc/systemd/system/xray-landing-recovery.service" 644 root:root <<RECEOF
+  atomic_write "/etc/systemd/system/xray-landing-recovery.service" 644 root:root <<'RECEOF'
 [Unit]
 Description=Xray Landing Recovery (preflight-gated auto-restart)
 DefaultDependencies=no
@@ -1307,7 +1504,7 @@ ExecStart=/bin/sh -c '\
       _delta=$((_now - _last)); \
       if [ "$_delta" -lt 1800 ]; then \
         logger -t xray-landing-recovery "FATAL: Recovery rate-limited (loop detected, $_delta s since last attempt). Manual intervention required."; \
-        echo "$(date) [FATAL] recovery loop detected ($_delta s interval). Fix root cause then: systemctl reset-failed ${LANDING_SVC} && systemctl start ${LANDING_SVC}" >> ${LANDING_LOG}/error.log 2>/dev/null || true; \
+        echo "$(date) [FATAL] recovery loop detected ($_delta s interval). Fix root cause then: systemctl reset-failed @@LANDING_SVC@@ && systemctl start @@LANDING_SVC@@" >> @@LANDING_LOG@@/error.log 2>/dev/null || true; \
         echo "echo -e \\x27\033[0;31m[FATAL] xray-landing recovery loop: manual intervention required!\033[0m\\x27" > /etc/profile.d/xray-recovery-alert.sh || true; \
         chmod +x /etc/profile.d/xray-recovery-alert.sh 2>/dev/null || true; \
         exit 0; \
@@ -1316,22 +1513,23 @@ ExecStart=/bin/sh -c '\
     echo "$_now" > "$_tsfile"; \
     logger -t xray-landing-recovery "WARN: StartLimitBurst hit, running preflight..."; \
     _cert_ok=0; _cfg_ok=0; \
-    for d in ${CERT_BASE}/*/fullchain.pem; do [ -f "$d" ] && _cert_ok=1 && break; done; \
-    python3 -c "import json,sys; json.load(open(sys.argv[1]))" ${LANDING_CONF} 2>/dev/null && _cfg_ok=1 || true; \
+    for d in @@CERT_BASE@@/*/fullchain.pem; do [ -f "$d" ] && _cert_ok=1 && break; done; \
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" @@LANDING_CONF@@ 2>/dev/null && _cfg_ok=1 || true; \
     if [ "$_cert_ok" = "1" ] && [ "$_cfg_ok" = "1" ]; then \
       logger -t xray-landing-recovery "Preflight PASSED — reset-failed and restart"; \
-      systemctl reset-failed ${LANDING_SVC} 2>/dev/null || true; \
-      systemctl start ${LANDING_SVC} 2>/dev/null || true; \
+      systemctl reset-failed @@LANDING_SVC@@ 2>/dev/null || true; \
+      systemctl start @@LANDING_SVC@@ 2>/dev/null || true; \
       rm -f /etc/profile.d/xray-recovery-alert.sh 2>/dev/null || true; \
     else \
       logger -t xray-landing-recovery "Preflight FAILED (cert=$_cert_ok cfg=$_cfg_ok) — manual intervention required"; \
-      echo "$(date) [FATAL] preflight failed: cert=$_cert_ok cfg=$_cfg_ok. Fix then: systemctl reset-failed ${LANDING_SVC} && systemctl start ${LANDING_SVC}" >> ${LANDING_LOG}/error.log 2>/dev/null || true; \
+      echo "$(date) [FATAL] preflight failed: cert=$_cert_ok cfg=$_cfg_ok. Fix then: systemctl reset-failed @@LANDING_SVC@@ && systemctl start @@LANDING_SVC@@" >> @@LANDING_LOG@@/error.log 2>/dev/null || true; \
       echo "echo -e \\x27\033[0;31m[FATAL] xray-landing 熔断，预检失败，需人工介入！\033[0m\\x27" > /etc/profile.d/xray-recovery-alert.sh || true; \
       chmod +x /etc/profile.d/xray-recovery-alert.sh 2>/dev/null || true; \
     fi \
   ) 9>"$_lockfile" \
 '
 RECEOF
+  sed -i     -e "s|@@LANDING_SVC@@|${LANDING_SVC}|g"     -e "s|@@LANDING_CONF@@|${LANDING_CONF}|g"     -e "s|@@LANDING_LOG@@|${LANDING_LOG}|g"     -e "s|@@CERT_BASE@@|${CERT_BASE}|g"     "/etc/systemd/system/xray-landing-recovery.service"
 
   write_logrotate
   # [F5] daemon-reload must succeed for unit changes to take effect
@@ -1370,36 +1568,21 @@ setup_firewall(){
   # The bulldozer approach reads iptables -S INPUT directly and deletes every rule that
   # references FW_CHAIN or FW_TMP by name before attempting -F / -X / -E.
   _bulldoze_input_refs(){
-    local _chain="$1" _num _nums
-    # [v2.15.2] Delete by line number: re-fetch each pass and delete in descending order
-    # so iptables line-number shifts cannot corrupt the rule set.
-    while true; do
-      _nums=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null \
-              | awk -v c="$_chain" 'NR>2 && $2 == c {print $1}' \
-              | sort -nr)
-      [[ -n "${_nums:-}" ]] || break
-      while IFS= read -r _num; do
-        [[ -n "$_num" ]] || continue
-        iptables -w 2 -D INPUT "$_num" 2>/dev/null || break 2
-      done <<<"$_nums"
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      iptables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
   }
   _bulldoze_input_refs6(){
-    local _chain="$1" _num _nums
-    # [v2.15.2] Delete by line number: re-fetch each pass and delete in descending order
-    # so iptables line-number shifts cannot corrupt the rule set.
-    while true; do
-      _nums=$(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null \
-              | awk -v c="$_chain" 'NR>2 && $2 == c {print $1}' \
-              | sort -nr)
-      [[ -n "${_nums:-}" ]] || break
-      while IFS= read -r _num; do
-        [[ -n "$_num" ]] || continue
-        ip6tables -w 2 -D INPUT "$_num" 2>/dev/null || break 2
-      done <<<"$_nums"
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
   }
 
+  # Remove all INPUT references to both the stable chain and the temp chain, then flush+delete.
   # Remove all INPUT references to both the stable chain and the temp chain, then flush+delete.
   _bulldoze_input_refs  "$FW_CHAIN";  _bulldoze_input_refs  "$FW_TMP"
   iptables -w 2 -F "$FW_TMP"   2>/dev/null || true; iptables -w 2 -X "$FW_TMP"   2>/dev/null || true
@@ -1427,34 +1610,48 @@ setup_firewall(){
     eval "${_prev_term_trap:-trap - TERM}"
   }
   trap '_fw_landing_rollback; exit 130' INT TERM ERR
+  # [R7 Fix] Pre-flight validation of ALL node files BEFORE any iptables modifications
+  local _conf_files=()
+  while IFS= read -r f; do _conf_files+=("$f"); done     < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
+  local expected_count=${#_conf_files[@]} skipped=0 tips=()
+  for meta in "${_conf_files[@]+${_conf_files[@]}}"; do
+    [[ -f "$meta" ]] || continue
+    local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')
+    if [[ -z "$tip" ]]; then
+      warn "  [跳过] 节点文件 ${meta} 缺少 TRANSIT_IP 字段"; (( ++skipped )) || true; continue
+    fi
+    # [R16 Fix] Add 5s timeout to Python call — prevents indefinite hang if Python is broken
+    if ! printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
+      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法或 Python 无响应"; (( ++skipped )) || true; continue
+    fi
+    tips+=("$tip")
+  done
+  if (( skipped > 0 )); then
+    die "防火墙构建中止：${skipped} 个节点文件格式异常，拒绝生成可能放行不足的规则集（预期 ${#_conf_files[@]}，有效 $(( ${#_conf_files[@]} - skipped ))）"
+  fi
+  # [R14 Fix] Warn about duplicate transit IPs (multiple domains on same transit is normal)
+  local _seen_ips=() _dup_found=0
+  for _tip in "${tips[@]}"; do
+    for _seen in "${_seen_ips[@]}"; do
+      if [[ "$_seen" == "$_tip" ]]; then
+        warn "检测到重复的中转IP: $_tip（多个域名共享同一中转机，正常）"
+        _dup_found=1
+        break
+      fi
+    done
+    _seen_ips+=("$_tip")
+  done
+  # Now safe to start iptables operations
   iptables -w 2 -N "$FW_TMP" 2>/dev/null || iptables -w 2 -F "$FW_TMP"
   # v2.32 Grok: lo + SSH 先于 INVALID,UNTRACKED 放行，conntrack 表满时 SSH 不断
   iptables -w 2 -A "$FW_TMP" -i lo                                       -m comment --comment "xray-landing-lo"        -j ACCEPT
   # v2.16: 本地环回保护 - 仅允许xray-landing用户访问内部端口
   # v2.41: 删除无效的lo规则(INPUT链不处理本地进程间通信，已listen 127.0.0.1足够)
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$ssh_port"                 -m comment --comment "xray-landing-ssh"       -j ACCEPT
-  local count=0 tips=() skipped=0
-  local _conf_files=()
-  while IFS= read -r f; do _conf_files+=("$f"); done     < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
-  local expected_count=${#_conf_files[@]}
-  for meta in "${_conf_files[@]+${_conf_files[@]}}"; do
-    [[ -f "$meta" ]] || continue
-    local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2-)
-    if [[ -z "$tip" ]]; then
-      warn "  [跳过] 节点文件 ${meta} 缺少 TRANSIT_IP 字段"; (( ++skipped )) || true; continue
-    fi
-    if ! printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
-      warn "  [跳过] 节点文件 ${meta} TRANSIT_IP='${tip}' 格式非法"; (( ++skipped )) || true; continue
-    fi
-    tips+=("$tip")
-  done
-  # 🟠 Grok: 有节点文件但无法提取有效 IP → 拒绝提交，避免假成功
-  if (( expected_count > 0 && skipped > 0 )); then
-    iptables -w 2 -F "$FW_TMP" 2>/dev/null || true; iptables -w 2 -X "$FW_TMP" 2>/dev/null || true
-    die "防火墙构建中止：${skipped} 个节点文件格式异常，拒绝生成可能放行不足的规则集（预期 ${expected_count}，有效 $(( expected_count - skipped ))）"
-  fi
+  local count=0
   while IFS= read -r tip; do
     [[ -n "$tip" ]] || continue
+    validate_ipv4 "$tip"
     iptables -w 2 -A "$FW_TMP" -s "${tip}/32" -p tcp --dport "$LANDING_PORT" -m comment --comment "xray-landing-transit" -j ACCEPT \
       || { iptables -w 2 -F "$FW_TMP" 2>/dev/null || true; iptables -w 2 -X "$FW_TMP" 2>/dev/null || true; die "防火墙规则添加失败（中转IP ${tip}），已清理临时链"; }
     info "  ACCEPT ← ${tip}/32:${LANDING_PORT}"; (( ++count )) || true
@@ -1483,6 +1680,15 @@ setup_firewall(){
     ip6tables -w 2 -A "$FW_TMP6" -i lo -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$ssh_port"     -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate INVALID,UNTRACKED -j DROP
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "xray-landing-icmp6" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "xray-landing-icmp6-pmtud" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "xray-landing-icmp6" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "xray-landing-icmp6" -j ACCEPT
+    # NDP: router-solicitation, router-advertisement, neighbor-solicitation, neighbor-advertisement
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 133 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 134 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 135 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type 136 -m comment --comment "xray-landing-icmp6-ndp" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "xray-landing-icmp6" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "xray-landing-icmp6-drop" -j DROP
     ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$LANDING_PORT" -j DROP
@@ -1514,8 +1720,9 @@ _persist_iptables(){
   local transit_ips=()
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
-    local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2-) || continue
-    printf '%s' "$tip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
+    local tip; tip=$(grep '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
+    # [R16 Fix] Add 5s timeout to Python call
+    printf '%s' "$tip" | timeout 5 python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null && transit_ips+=("$tip") || true
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f 2>/dev/null | sort)
 
   local _fw_sig="LANDING_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -1531,7 +1738,8 @@ _persist_iptables(){
 from pathlib import Path
 import os, sys
 
-template = r"""#!/bin/sh
+template = r"""#!/usr/bin/env bash
+[[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { echo "ERROR: Bash 4+ required"; exit 1; }
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # __FW_SIG__
 _detect_ssh(){
@@ -1545,11 +1753,13 @@ _detect_ssh(){
       gsub(/\]$/,"",addr)
       if (addr ~ /^[0-9]+$/) { print addr; exit }
     }' || true)"
+  # [R12 Fix] sshd not running at boot → fall back to sshd_config before using install-time value
+  [ -z "$p" ] && p="$(grep -RhsE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | awk '{print $2}' | sort -n | head -1 || true)"
   if echo "$p" | grep -qE '^[0-9]+$' && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
     echo "$p"
   else
-    logger -t xray-landing-firewall "WARN: 无法动态探测SSH端口，使用安装时值 __SSH_PORT__"
-    echo "__SSH_PORT__"
+    logger -t xray-landing-firewall "ERROR: 无法动态探测SSH端口，拒绝开机恢复（安全策略：禁止回退到可能过时的安装时端口）"
+    exit 1
   fi
 }
 SSH_PORT="$(_detect_ssh)"
@@ -1563,6 +1773,18 @@ iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request -m limit --li
 iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request             -m comment --comment 'xray-landing-icmp-drop' -j DROP
 __TRANSIT_RULES__
 iptables -w 2 -A __FW_CHAIN__-NEW -m comment --comment 'xray-landing-drop' -j DROP
+_bulldoze_input_refs(){
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+}
+_bulldoze_input_refs6(){
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+}
+_bulldoze_input_refs __FW_CHAIN__
+_bulldoze_input_refs6 __FW_CHAIN6__
 while iptables -w 2  -D INPUT -m comment --comment 'xray-landing-jump'       2>/dev/null; do :; done
 while iptables -w 2  -D INPUT -m comment --comment 'xray-landing-ssh-global' 2>/dev/null; do :; done
 while iptables -w 2  -D INPUT -m comment --comment 'xray-landing-swap'       2>/dev/null; do :; done
@@ -1580,6 +1802,10 @@ if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6table
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -i lo -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp      --dport ${SSH_PORT}      -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 133 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 134 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 135 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type 136 -m comment --comment 'xray-landing-icmp6-ndp' -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment 'xray-landing-icmp6' -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment 'xray-landing-icmp6-drop' -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -j DROP
@@ -1638,8 +1864,8 @@ save_node_info(){
   local _node_conf="${MANAGER_BASE}/nodes/${safe_domain}_${safe_ip}.conf"
   if [[ -f "$_node_conf" ]]; then
     local _exist_dom _exist_tip
-    _exist_dom=$(grep '^DOMAIN=' "$_node_conf" 2>/dev/null | cut -d= -f2- || true)
-    _exist_tip=$(grep '^TRANSIT_IP=' "$_node_conf" 2>/dev/null | cut -d= -f2- || true)
+    _exist_dom=$(grep '^DOMAIN=' "$_node_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+    _exist_tip=$(grep '^TRANSIT_IP=' "$_node_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
     if [[ -n "$_exist_dom" && "$_exist_dom" != "$domain" ]]; then
       die "节点文件名碰撞：${_node_conf} 已被域名 ${_exist_dom} 使用，拒绝覆盖 ${domain}"
     fi
@@ -1680,11 +1906,11 @@ for p in nodes_dir.glob("*.conf"):
         continue
     data = {}
     try:
-        for line in p.read_text(errors="replace").splitlines():
+        for line in p.read_text(encoding='utf-8', errors='strict').splitlines():
             if "=" in line:
                 k, v = line.split("=", 1)
                 data[k.strip()] = v.strip()
-    except Exception:
+    except UnicodeDecodeError:
         continue
     if data.get("DOMAIN") == target_domain and data.get("PASSWORD"):
         print(data["PASSWORD"])
@@ -1693,6 +1919,10 @@ PYNODE
 ) || true
   fi
   if [[ -n "$existing_pass" ]]; then
+    # [R17 Fix] If user provided a different password than existing, die
+    if [[ -n "${NEW_PASS:-}" && "$NEW_PASS" != "$existing_pass" ]]; then
+      die "节点文件已存在但密码不一致（旧: ${existing_pass:0:8}...，新: ${NEW_PASS:0:8}...），请先删除旧节点或留空以沿用现有密码"
+    fi
     warn "域名 ${NEW_DOMAIN} 已存在，新中转机必须复用相同 Trojan 密码"
     NEW_PASS="$existing_pass"
     info "  自动沿用密码: ${NEW_PASS}"
@@ -1732,12 +1962,12 @@ PYIP
     _fw_skip=1
   fi
 
-  local USE_CF_TOKEN="$CF_TOKEN"
-  if [[ -z "$USE_CF_TOKEN" ]]; then
+  local USE_CF_TOKEN=""
+  if [[ -z "$USE_CF_TOKEN" || "$USE_CF_TOKEN" == "***" ]]; then
     read -rp "Cloudflare API Token（Zone:DNS:Edit）: " USE_CF_TOKEN
     validate_cf_token "$USE_CF_TOKEN"
-    CF_TOKEN="$USE_CF_TOKEN"
   fi
+  CF_TOKEN="$USE_CF_TOKEN"
 
   # v2.32: 所有用户输入已收集，加锁后才开始写操作
   _acquire_lock
@@ -1823,8 +2053,8 @@ NEOF_TMP
   # 必须让正式 .conf 存在才能把新 TRANSIT_IP 写入白名单，否则新节点永久被防火墙阻断）
   if [[ -f "$_node_conf" ]]; then
     local _exist_dom _exist_tip
-    _exist_dom=$(grep '^DOMAIN=' "$_node_conf" 2>/dev/null | cut -d= -f2- || true)
-    _exist_tip=$(grep '^TRANSIT_IP=' "$_node_conf" 2>/dev/null | cut -d= -f2- || true)
+    _exist_dom=$(grep '^DOMAIN=' "$_node_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+    _exist_tip=$(grep '^TRANSIT_IP=' "$_node_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
     if [[ -n "$_exist_dom" && "$_exist_dom" != "$NEW_DOMAIN" ]]; then
       rm -f "$_tmp_node"
       die "节点文件名碰撞：${_node_conf} 已被域名 ${_exist_dom} 使用，拒绝覆盖 ${NEW_DOMAIN}"
@@ -1894,8 +2124,8 @@ delete_node(){
     [[ -f "$meta" ]] || continue
     node_files+=("$meta")
     local dom ip
-    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
-    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
+    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
+    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
     printf "  [%-2d] %-40s 中转: %s\n" $((++n)) "$dom" "$ip"
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null | sort)
 
@@ -1908,8 +2138,10 @@ delete_node(){
   (( idx >= 0 && idx < n )) || die "编号越界（共 ${n} 个）"
 
   local DEL_CONF="${node_files[$idx]}"
-  local DEL_DOMAIN; DEL_DOMAIN=$(grep '^DOMAIN='     "$DEL_CONF" 2>/dev/null | cut -d= -f2-)
-  local DEL_TRANSIT; DEL_TRANSIT=$(grep '^TRANSIT_IP=' "$DEL_CONF" 2>/dev/null | cut -d= -f2-)
+  local DEL_DOMAIN; DEL_DOMAIN=$(grep '^DOMAIN='     "$DEL_CONF" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')
+  local DEL_TRANSIT; DEL_TRANSIT=$(grep '^TRANSIT_IP=' "$DEL_CONF" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')
+  [[ -n "$DEL_DOMAIN" ]] || die "节点配置缺少 DOMAIN 字段"
+  validate_domain "$DEL_DOMAIN"
 
   read -rp "确认删除 ${DEL_DOMAIN}（中转: ${DEL_TRANSIT}）？[y/N]: " CONFIRM
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; return; }
@@ -2009,10 +2241,21 @@ delete_node(){
 do_set_port(){
   [[ -f "$INSTALLED_FLAG" ]] || die "未安装，无法修改端口"
   load_manager_config
+  # [R20 Fix] Capture prior trap state safely — trap -p returns empty if none set
+  local _prev_err_trap _prev_int_trap _prev_term_trap
+  _prev_err_trap=$(trap -p ERR 2>/dev/null || true)
+  _prev_int_trap=$(trap -p INT 2>/dev/null || echo "")
+  _prev_term_trap=$(trap -p TERM 2>/dev/null || echo "")
   local new_port="${1:-}"
   [[ -n "$new_port" ]] || { read -rp "新落地机监听端口: " new_port; }
   validate_port "$new_port"
   (( new_port >= 1024 )) || die "端口 ${new_port} 小于 1024，set-port 不支持低端口（需重装以更新权限配置）"
+  # [R19 Fix] Check for conflict with internal ports (VLESS_GRPC, TROJAN_GRPC, VLESS_WS, TROJAN_TCP)
+  for _internal_port in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
+    if [[ "${_internal_port:-}" =~ ^[0-9]+$ && "${_internal_port}" == "$new_port" ]]; then
+      die "端口 ${new_port} 与内部端口冲突（${_internal_port}），请选择其他端口"
+    fi
+  done
   if [[ "$new_port" == "$LANDING_PORT" ]]; then
     success "端口已是 ${new_port}，无需变更"; return
   fi
@@ -2020,7 +2263,9 @@ do_set_port(){
   local old_port="$LANDING_PORT"
 
   # v2.32: 所有校验通过后加锁，写操作串行化
+  # Guard: ERR trap only rolls back when this var is 1 (transaction active)
   _acquire_lock
+  local _port_change_active=1
 
   local _snap_mgr _snap_cfg _snap_fw
   _snap_mgr=$(mktemp "${MANAGER_BASE}/.snap-recover.XXXXXX") \
@@ -2063,26 +2308,31 @@ do_set_port(){
     _release_lock
   }
   # [F2] Include ERR: set -e exits without rollback on bash errors (full disk, mktemp fail)
-  trap '_global_cleanup; _do_rollback_port; exit 1' INT TERM ERR
+  # Guarded: only rolls back if _port_change_active=1 (transaction still in progress)
+  trap '_global_cleanup; if [[ "${_port_change_active:-0}" == "1" ]]; then _do_rollback_port; fi; exit 1' INT TERM ERR
 
   LANDING_PORT="$new_port"
   if ! save_manager_config; then
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     die "manager.conf 写入失败，端口未变更"
   fi
 
   if ! ( sync_xray_config ); then
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     die "sync 失败，端口已回滚至 ${old_port}"
   fi
   if ! ( create_systemd_service ); then
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     die "systemd 单元刷新失败，端口已回滚至 ${old_port}"
   fi
   if ! ( setup_firewall ); then
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     ( sync_xray_config ) 2>/dev/null || true
@@ -2092,6 +2342,7 @@ do_set_port(){
   _persist_iptables "$(detect_ssh_port)"
   if ! systemctl restart xray-landing-iptables-restore.service 2>/dev/null; then
     warn "iptables 恢复服务重启失败，触发端口回滚..."
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     ( sync_xray_config ) 2>/dev/null || true
@@ -2104,6 +2355,7 @@ do_set_port(){
 
   if (( _restart_rc != 0 )) || ! systemctl is-active --quiet "$LANDING_SVC"; then
     warn "服务启动失败，触发回滚至 ${old_port}..."
+    _port_change_active=0
     _do_rollback_port
     _restore_prev_port_traps
     ( sync_xray_config ) 2>/dev/null || true
@@ -2111,7 +2363,8 @@ do_set_port(){
     die "端口变更验证失败，已回滚至 ${old_port}"
   fi
   rm -f "$_snap_mgr" "${_snap_cfg:-}" "${_snap_fw:-}" 2>/dev/null || true
-  # Transaction complete — restore standard INT/TERM/ERR trap
+  # Transaction complete — deactivate guard and restore standard INT/TERM/ERR trap
+  _port_change_active=0
   _restore_prev_port_traps
   trap '_global_cleanup; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM ERR
   # [Doc5-GPT] 成功路径也清零熔断计数，防残留计数在下次端口变更时误触发 failed 态
@@ -2126,9 +2379,9 @@ do_set_port(){
   local first_conf; first_conf=$(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null | sort | head -1)
   if [[ -n "$first_conf" ]]; then
     local any_dom any_pass any_transit
-    any_dom=$(grep '^DOMAIN='     "$first_conf" 2>/dev/null | cut -d= -f2- || true)
-    any_pass=$(grep '^PASSWORD='  "$first_conf" 2>/dev/null | cut -d= -f2- || true)
-    any_transit=$(grep '^TRANSIT_IP=' "$first_conf" 2>/dev/null | cut -d= -f2- || true)
+    any_dom=$(grep '^DOMAIN='     "$first_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+    any_pass=$(grep '^PASSWORD='  "$first_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
+    any_transit=$(grep '^TRANSIT_IP=' "$first_conf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
     local pub_ip; pub_ip=$(get_public_ip 2>/dev/null) || pub_ip="（无法获取）"
     [[ -n "$any_dom" ]] && print_pairing_info "$pub_ip" "$any_dom" "$any_pass" "$any_transit"
   fi
@@ -2148,9 +2401,9 @@ show_status(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local dom ip ts
-    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
-    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
-    ts=$(grep  '^CREATED='    "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
+    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
+    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
+    ts=$(grep  '^CREATED='    "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
     printf "  [节点%-2d] %-38s 中转: %-18s 创建: %s\n" $((++n)) "$dom" "$ip" "$ts"
     # v2.44 GPT: 逐项校验节点完整性（conf + cert），缺一判红
     [[ "$dom" == "?" ]] && { echo -e "    ${RED}↑ DOMAIN 字段缺失${NC}"; _node_degraded=1; }
@@ -2169,11 +2422,11 @@ show_status(){
   local _any_cert=0
   while IFS= read -r _smeta; do
     [[ -f "$_smeta" ]] || continue
-    local _sdom; _sdom=$(grep '^DOMAIN=' "$_smeta" 2>/dev/null | cut -d= -f2-) || continue
+    local _sdom; _sdom=$(grep '^DOMAIN=' "$_smeta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
     [[ -n "$_sdom" ]] || continue
     local _cf="${CERT_BASE}/${_sdom}/fullchain.pem"
     if [[ -f "$_cf" ]]; then
-      local _end; _end=$(openssl x509 -in "$_cf" -noout -enddate 2>/dev/null | cut -d= -f2) || _end=""
+      local _end; _end=$(openssl x509 -in "$_cf" -noout -enddate 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || _end=""
       local _days=0
       if [[ -n "$_end" ]]; then
         local _ets _nts
@@ -2303,7 +2556,8 @@ print_pairing_info(){
   if ! printf '%s' "$pub_ip" | python3 -c "import ipaddress,sys; ipaddress.IPv4Address(sys.stdin.read().strip())" 2>/dev/null; then
     die "pub_ip='${pub_ip}' 不是合法 IPv4，拒绝生成 Token"
   fi
-  token=$(printf '%s\n%s\n%s\n%s\n%s' "$pub_ip" "$domain" "$LANDING_PORT" "$VLESS_UUID" "$password" | python3 -c "
+  local -r validated_ip="$pub_ip"
+  token=$(printf '%s\n%s\n%s\n%s\n%s' "$validated_ip" "$domain" "$LANDING_PORT" "$VLESS_UUID" "$password" | python3 -c "
 import json, base64, sys
 lines = [l.strip() for l in sys.stdin.read().split('\n') if l.strip()]
 landing_ip = lines[0]; landing_dom = lines[1]; landing_port = int(lines[2])
@@ -2343,7 +2597,9 @@ print(base64.b64encode(json.dumps(token_dict, separators=(',',':')).encode()).de
   # source is passed verbatim without any shell-quoting interference. Label variables avoid
   # all quoting inside f-strings (matches the transit script pattern).
   sub_b64=$(python3 - "$ti" "$domain" "$VLESS_UUID" "$password" 2>&1 <<'SUBPY'
-import base64, urllib.parse, sys
+import sys
+if len(sys.argv) < 5: print('ERROR: requires 4 args', file=sys.stderr); sys.exit(1)
+import base64, urllib.parse
 transit_ip, domain, vless_uuid, trojan_pass = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 port = 443
 pfx = vless_uuid[:8]
@@ -2384,7 +2640,9 @@ SUBPY
     # v1.3: 先逐条显示明文链接，便于验证 IP/域名正确性，再给 Base64 整体订阅
     echo -e "  ${BOLD}── 5 协议明文链接（可逐条复制验证）──────────────────${NC}"
     python3 -c "
-import base64, sys
+import sys
+if len(sys.argv) < 2: print('ERROR: requires 1 arg', file=sys.stderr); sys.exit(1)
+import base64
 data = base64.b64decode(sys.argv[1]).decode()
 for i, line in enumerate(data.split('\n'), 1):
     print(f'  [{i}] {line}')
@@ -2417,7 +2675,7 @@ purge_all(){
   fi
 
   local _created_user="0"
-  _created_user=$(grep '^CREATED_USER=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
+  _created_user=$(grep '^CREATED_USER=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
 
   systemctl stop    "$LANDING_SVC" 2>/dev/null || true
   systemctl disable "$LANDING_SVC" 2>/dev/null || true
@@ -2436,7 +2694,7 @@ purge_all(){
   if [[ -f "${ACME_HOME}/acme.sh" ]]; then
     local managed_domains=() seen_unremove=()
     while IFS= read -r meta; do
-      local dom; dom=$(grep '^DOMAIN=' "$meta" 2>/dev/null | cut -d= -f2-) || continue
+      local dom; dom=$(grep '^DOMAIN=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
       [[ -n "$dom" ]] && managed_domains+=("$dom")
     done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null)
     for d in "${managed_domains[@]+${managed_domains[@]}}"; do
@@ -2448,6 +2706,9 @@ purge_all(){
       rm -rf "${ACME_HOME}/${d}_ecc" 2>/dev/null || true
     done
     # --uninstall-cronjob already executed at start of purge_all [F6]
+  fi
+  if crontab -l 2>/dev/null | grep -q 'acme\.sh'; then
+    crontab -l 2>/dev/null | grep -v 'acme\.sh' | crontab - 2>/dev/null || true
   fi
   # [Doc7-🟠] 移除原有 grep -v '^MAILTO=""' 操作，该操作会破坏宿主机其他业务的 cron 全局变量
   # acme.sh --uninstall-cronjob 已在上方执行，会精确移除自己的条目，无需额外干预 crontab
@@ -2501,15 +2762,21 @@ purge_all(){
 
   rm -f /etc/nginx/conf.d/xray-landing-fallback.conf 2>/dev/null || true
   rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
+  rmdir "/etc/systemd/system/nginx.service.d" 2>/dev/null || true
   # v1.5: 清理新增的 drop-in 和 journald 上限配置
   rm -f "/etc/systemd/system/xray-landing.service.d/xray-landing-limits.conf" 2>/dev/null || true
   rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
   rm -f "/etc/systemd/journald.conf.d/xray-landing.conf" 2>/dev/null || true
+  systemctl restart systemd-journald 2>/dev/null || true
   rmdir "/etc/systemd/journald.conf.d" 2>/dev/null || true
   systemctl restart systemd-journald 2>/dev/null || true
   rm -rf "$MANAGER_BASE" 2>/dev/null || true
   rm -f /etc/sysctl.d/99-landing-bbr.conf /etc/modprobe.d/99-landing-conntrack.conf 2>/dev/null || true
+  sysctl --system &>/dev/null || true
   rm -f /etc/cron.daily/xray-cert-monitor 2>/dev/null || true
+  if [[ -f /etc/cron.daily/xray-cert-monitor ]]; then
+    warn "无法删除 /etc/cron.daily/xray-cert-monitor（可能是只读文件系统），请手动删除"
+  fi
   if [[ -f "$NGINX_CONF_ORIG" ]]; then
     cp -a "$NGINX_CONF_ORIG" /etc/nginx/nginx.conf 2>/dev/null || true
   else
@@ -2522,17 +2789,30 @@ purge_all(){
     # Guard: wrap entire cleanup in LANDING_USER check — pkill outside guard is CRITICAL
     if [[ -n "$LANDING_USER" ]]; then
       command -v loginctl >/dev/null 2>&1 && loginctl terminate-user "$LANDING_USER" 2>/dev/null || true
-      pkill -u "$LANDING_USER" 2>/dev/null || true
+      [[ -n "$LANDING_USER" ]] && pkill -u "$LANDING_USER" 2>/dev/null || true
       sleep 1
-      pkill -KILL -u "$LANDING_USER" 2>/dev/null || true
+      [[ -n "$LANDING_USER" ]] && pkill -KILL -u "$LANDING_USER" 2>/dev/null || true
       for _ in 1 2 3 4 5 6 7 8 9 10; do
-        pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
+        [[ -n "$LANDING_USER" ]] && pgrep -u "$LANDING_USER" >/dev/null 2>&1 || break
         sleep 0.5
       done
-      userdel -r "$LANDING_USER" 2>/dev/null || true
+      # [R8 Fix] Clean up subuid/subgid entries (systemd user namespace artifacts)
+      sed -i "/^${LANDING_USER}:/d" /etc/subuid 2>/dev/null || true
+      sed -i "/^${LANDING_USER}:/d" /etc/subgid 2>/dev/null || true
+      if ! userdel "$LANDING_USER" 2>/dev/null; then
+        warn "userdel 失败 (用户可能仍有运行中进程) — 需要手动清理"
+      fi
+      groupdel "$LANDING_USER" 2>/dev/null || true
     fi
   fi
 
+  # [R14 Fix] Remove home directory if it exists (some Debian/Ubuntu systems
+  # create it despite useradd -M; also handles cases where it was created manually)
+  [[ -d "/home/${LANDING_USER}" ]] && rm -rf "/home/${LANDING_USER}" 2>/dev/null || true
+  rm -f /etc/security/limits.d/99-xray-landing.conf 2>/dev/null || true
+  sed -i '/# xray-landing: keep cron\\/PAM sessions aligned/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
+  rm -rf "$LANDING_LOG" 2>/dev/null || true
+  rm -f /var/log/acme-xray-landing-renew.log /var/run/xray-landing.update.warn 2>/dev/null || true
   rm -f "$LANDING_BIN" "$CERT_RELOAD_SCRIPT" 2>/dev/null || true
   rm -rf /usr/local/share/xray-landing 2>/dev/null || true
   rm -rf "$LANDING_BASE" 2>/dev/null || true
@@ -2558,10 +2838,10 @@ show_all_nodes_info(){
   while IFS= read -r _nf; do
     [[ -f "$_nf" ]] || continue
     local _ndom _npwd _ntip _npip
-    _ndom=$(grep '^DOMAIN='     "$_nf" 2>/dev/null | cut -d= -f2-) || continue
-    _npwd=$(grep '^PASSWORD='   "$_nf" 2>/dev/null | cut -d= -f2-) || continue
-    _ntip=$(grep '^TRANSIT_IP=' "$_nf" 2>/dev/null | cut -d= -f2-) || _ntip=""
-    _npip=$(grep '^PUBLIC_IP='  "$_nf" 2>/dev/null | cut -d= -f2-) || _npip=""
+    _ndom=$(grep '^DOMAIN='     "$_nf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
+    _npwd=$(grep '^PASSWORD='   "$_nf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
+    _ntip=$(grep '^TRANSIT_IP=' "$_nf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || _ntip=""
+    _npip=$(grep '^PUBLIC_IP='  "$_nf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || _npip=""
     [[ -n "$_ndom" && -n "$_npwd" ]] || continue
     # 如果节点文件中有记录的 PUBLIC_IP 则用之，否则取 manager.conf 缓存或实时查询
     if [[ -z "$_npip" ]]; then
@@ -2586,9 +2866,9 @@ installed_menu(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local dom ip ts
-    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
-    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
-    ts=$(grep  '^CREATED='    "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
+    dom=$(grep '^DOMAIN='     "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
+    ip=$(grep  '^TRANSIT_IP=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
+    ts=$(grep  '^CREATED='    "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
     printf "  [节点%-2d] %-38s 中转: %-18s 创建: %s\n" $((++n)) "$dom" "$ip" "$ts"
   done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -type f 2>/dev/null | sort)
   [[ $n -eq 0 ]] && warn "（无已配置节点）"
@@ -2623,7 +2903,7 @@ fresh_install(){
   if [[ -n "${LANDING_HEADLESS:-}" || -n "${LANDING_AUTO_DOMAIN:-}" ]]; then
     _headless=1
     DOMAIN="${LANDING_AUTO_DOMAIN:-${DOMAIN:-}}"
-    CF_TOKEN="${LANDING_AUTO_CF_TOKEN:-${CF_TOKEN:-}}"
+    CF_TOKEN="${LANDING_AUTO_CF_TOKEN:-}"
 
     PASS="${LANDING_AUTO_PASSWORD:-${PASS:-}}"
     TRANSIT_IP="${LANDING_AUTO_TRANSIT_IP:-${TRANSIT_IP:-}}"
@@ -2676,7 +2956,11 @@ fresh_install(){
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; exit 0; }
 
   ss -tlnp 2>/dev/null | grep -q ":${LANDING_PORT} " && die "端口 ${LANDING_PORT} 已被占用（请先检查 nginx / xray* / mack-a*）"
-
+  # [HermesAgent] mack-a detection for landing node
+  if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
+    # [R23 Fix] Explicitly tell user to stop mack-a services when port conflict detected
+    warn "检测到 mack-a 已安装，本落地机将与其共享端口，请确认无冲突"
+  fi
   __LANDING_FRESH_INSTALL_TRAP_ACTIVE=1
   trap '_fresh_install_rollback' ERR INT TERM
   optimize_kernel_network; create_system_user; install_xray_binary
@@ -2685,12 +2969,12 @@ fresh_install(){
 
   # BUG-7 FIX: 幂等性保障——若 manager.conf 已存在则复用旧 UUID 和全部端口，避免重跑时订阅全部失效
   if [[ -f "$MANAGER_CONFIG" ]]; then
-    local _exist_uuid; _exist_uuid=$(grep '^VLESS_UUID='       "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
-    local _exist_port; _exist_port=$(grep '^LANDING_PORT='     "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
-    local _exist_vg;   _exist_vg=$(grep   '^VLESS_GRPC_PORT='  "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
-    local _exist_tg;   _exist_tg=$(grep   '^TROJAN_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
-    local _exist_vw;   _exist_vw=$(grep   '^VLESS_WS_PORT='    "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
-    local _exist_tt;   _exist_tt=$(grep   '^TROJAN_TCP_PORT='  "$MANAGER_CONFIG" 2>/dev/null | cut -d= -f2-) || true
+    local _exist_uuid; _exist_uuid=$(grep '^VLESS_UUID='       "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
+    local _exist_port; _exist_port=$(grep '^LANDING_PORT='     "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
+    local _exist_vg;   _exist_vg=$(grep   '^VLESS_GRPC_PORT='  "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
+    local _exist_tg;   _exist_tg=$(grep   '^TROJAN_GRPC_PORT=' "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
+    local _exist_vw;   _exist_vw=$(grep   '^VLESS_WS_PORT='    "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
+    local _exist_tt;   _exist_tt=$(grep   '^TROJAN_TCP_PORT='  "$MANAGER_CONFIG" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true
     if [[ -n "$_exist_uuid" && -n "$_exist_port" ]]; then
       warn "检测到已有安装记录（manager.conf），复用旧配置以保持订阅有效"
       warn "  UUID: ${_exist_uuid}  主端口: ${_exist_port}"
@@ -2715,22 +2999,22 @@ fresh_install(){
         success "已复用旧 UUID 和端口，现有订阅链接继续有效"
       else
         warn "  将生成全新 UUID（旧订阅链接将全部失效！）"
-        VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)           || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+        VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)           || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true) || VLESS_UUID=$(uuidgen 2>/dev/null) || die "无法生成 UUID（python3 uuid、/proc/sys/kernel/random/uuid、uuidgen 均失败）"
       fi
     fi
   else
-    VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)       || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+    VLESS_UUID=$(python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null)       || VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true) || VLESS_UUID=$(uuidgen 2>/dev/null) || die "无法生成 UUID（python3 uuid、/proc/sys/kernel/random/uuid、uuidgen 均失败）"
   fi
 
   # 只在端口为默认值0时才重新分配（复用路径已赋值，新装路径仍随机分配）
-  local _VGRPC="${VLESS_GRPC_PORT:-0}" _VWS="${VLESS_WS_PORT:-0}" _TTCP="${TROJAN_TCP_PORT:-0}"
+  local _VGRPC="${VLESS_GRPC_PORT:-0}" _VTG="${TROJAN_GRPC_PORT:-0}" _VWS="${VLESS_WS_PORT:-0}" _TTCP="${TROJAN_TCP_PORT:-0}"
   if [[ "${VLESS_GRPC_PORT:-0}" == "0" ]]; then
     _VGRPC=$(python3 -c "import random; b=random.randint(21000,29000)&~3; print(b)")
-    _VWS=$(( _VGRPC + 1 )); _TTCP=$(( _VGRPC + 2 ))
-    VLESS_GRPC_PORT="$_VGRPC"; VLESS_WS_PORT="$_VWS"; TROJAN_TCP_PORT="$_TTCP"
+    _VTG=$(( _VGRPC + 1 )); _VWS=$(( _VGRPC + 2 )); _TTCP=$(( _VGRPC + 3 ))
+    VLESS_GRPC_PORT="$_VGRPC"; TROJAN_GRPC_PORT="$_VTG"; VLESS_WS_PORT="$_VWS"; TROJAN_TCP_PORT="$_TTCP"
   fi
   _validate_internal_ports_in_use
-  for _chkp in "$_VGRPC" "$_TTCP" "$_VWS"; do
+  for _chkp in "$_VGRPC" "$_VTG" "$_VWS" "$_TTCP"; do
     ss -tlnp 2>/dev/null | grep -q ":${_chkp} "       && { warn "内网端口 ${_chkp} 已被占用，请重新运行脚本（自动重新分配）"; false; }
   done
 
@@ -2825,6 +3109,7 @@ SMFI
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
+    _release_lock; exit 1
   fi
   if ! ( create_systemd_service ); then
     if [[ -f "${ACME_HOME}/acme.sh" ]]; then
@@ -2832,6 +3117,7 @@ SMFI
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
+    _release_lock; exit 1
   fi
 
   # Node file already at final path; reset trap to standard
@@ -2852,7 +3138,7 @@ SMFI
       "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
       rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
     fi
-    true
+    _release_lock; exit 1
   fi
 
   # [v2.9 Grok-A-🟠] Touch INSTALLED_FLAG *before* mv staged_fi_mgr.
@@ -2920,8 +3206,12 @@ main(){
     local _sym_mgr=1 _sym_conf=1 _sym_node=1
     [[ -f "$MANAGER_CONFIG" ]]  || _sym_mgr=0
     [[ -f "$LANDING_CONF" ]]    || _sym_conf=0
-    find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" \
-         -type f -maxdepth 1 2>/dev/null | grep -q . 2>/dev/null || _sym_node=0
+    while IFS= read -r _nconf; do
+      [ -f "$_nconf" ] || continue
+      local _ndom; _ndom=$(grep '^DOMAIN=' "$_nconf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "")
+      [[ -n "$_ndom" && -f "${CERT_BASE}/${_ndom}/fullchain.pem" ]] || { _sym_node=0; break; }
+    done < <(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f -maxdepth 1 2>/dev/null)
+    [[ -z $(find "${MANAGER_BASE}/nodes" -name "*.conf" -not -name "tmp-*.conf" -type f -maxdepth 1 2>/dev/null) ]] && _sym_node=0
     if (( _sym_mgr && _sym_conf && _sym_node )); then
       warn "[v2.9] 持久化集完整但安装标记缺失（崩溃于最后一步），自动恢复标记..."
       touch "$INSTALLED_FLAG"

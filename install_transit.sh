@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-
-# v3.28-Optimized 变更记录
-# - 更新版本号至 v3.28-Optimized
-# - 修正 SSH 端口恢复探测的 ss 兜底仅取首条端口，避免多行输出误判
-# - journald 上限应用改为 restart，确保 sysctl/journal drop-in 立即生效
-# - 保持 flock FD 关闭、IPv6 探测、firewall bulldozer/connlimit、meta/map 回收修正
-# - 保持 detect_ssh_port_override 的 1-65535 范围校验与 non-strict 订阅生成
-# - 保持 IPv6 ICMP 限速、Token 导入强化、sysctl 运行态回收与 marker 化 nginx tuning
-# install_transit_v3.28-Optimized.sh — 中转机安装脚本 v3.28-Optimized
+# install_transit.sh — 中转机 SNI 路由脚本 v1.0
+# 架构：Nginx stream ssl_preread → Xray-core 落地机 TCP 直连
+# 特性：幂等安装 | 原子化路由写入 | 自动防火墙 | 完整卸载
+# - 增加 mack-a 显式检测（import_token + fresh_install）
+# - detect_ssh_port() 增加 command -v sshd guard
+# - 保持 Nginx stream SNI 盲传、双栈防火墙和 mack-a 零覆盖不变
+# install_transit_v3.61-Optimized.sh — 中转机安装脚本 v3.61-Optimized
 # 版本历史：
+# v3.61-Optimized: HermesAgent cycle 6 — [R1] MANAGER_BASE guard | [R2] iptables -E die | [R3] uuid/pwd/pfx validation | [R5] .map content validation
+# v3.60-Optimized: HermesAgent cycle 5 — [R2] transit_ip validation | [R5] INPUT pos warn | [R6] ssh_port numeric | [R7] hardlinks/symlinks | [R8] duplicate domain | [R9] sysctl cleanup | [R10] IPv6 fallback | [R22] FW_CHAIN whitelist
+# v3.58-Optimized: HermesAgent cycle 3 — [F4] IPv6 chain: fix INVALID DROP + correct rule order
+# v3.57-Optimized: HermesAgent cycle 2 — 架构不变，稳定性和安全加固
+# v3.56-Optimized: HermesAgent cycle 1 — 架构不变，稳定性和安全加固
+# v3.55-Optimized: 修复 atomic_write mktemp 空路径检查、nginx 快照失败 hard-die
+# v3.54-Optimized: 修复 daemon-reload 失败 hard-die（3处）
+# v3.50-Optimized: 全面安全加固，30项修复
+# v3.41-Optimized: 修正 VERSION 变量在 sed/grep 正则中的转义
+# v3.41-Optimized 变更记录
+# - 修正 _tune_nginx_worker_connections() 中 VERSION 变量在 sed/grep 正则中的转义
+# - 增加 mack-a 显式检测（import_token + fresh_install）
+# - detect_ssh_port() 增加 command -v sshd guard
+# - 保持 Nginx stream SNI 盲传、双栈防火墙和 mack-a 零覆盖不变
+# install_transit_v3.41-Optimized.sh — 中转机安装脚本 v3.41-Optimized
+# 版本历史：
+# v3.58-Optimized: HermesAgent cycle 3 — [F4] IPv6 chain: fix INVALID DROP + correct rule order
 # v2.80: 移除本地 decoy 死代码 / 中转流绑定 IPv6 / 悬挂 .map 自愈清理 / 防火墙恢复脚本改为 Python 模板替换
 # v2.70: 继续修复安全与鲁棒性：SSH 端口解析加固 / 域名安全名扩容 / 防火墙恢复脚本同步校验
 # v2.50: SNI嗅探 → 纯TCP盲传(TFO+KA=3m:10s:3+backlog=65535) → 落地机 | 动态双栈兼容
@@ -22,13 +37,22 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # R77: 修复atomic_write mktemp空路径检查、nginx快照失败hard-die
 # R77: 修复daemon-reload失败hard-die（3处）
 # R76: 修复所有mktemp空路径fallback错误检查
-readonly VERSION="v3.34-Optimized"
+# v3.39-Optimized 变更记录
+# - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
+# - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
+# - 保持 SNI 盲传与双栈防火墙结构不变
+readonly VERSION="v1.0"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-die()     { error "$*"; exit 1; }
-
+die() {
+  error "$*"
+  if declare -F _fresh_install_rollback >/dev/null; then _fresh_install_rollback 2>/dev/null || true; fi
+  if declare -F _import_install_rollback >/dev/null; then _import_install_rollback 2>/dev/null || true; fi
+  if declare -F _route_rollback >/dev/null; then _route_rollback 2>/dev/null || true; fi
+  exit 1
+}
 readonly MANAGER_BASE="/etc/transit_manager"
 readonly CONF_DIR="${MANAGER_BASE}/conf"
 readonly INSTALLED_FLAG="${MANAGER_BASE}/.installed"
@@ -47,7 +71,7 @@ readonly UPDATE_WARN_FILE="/var/run/transit-manager.update.warn"
 
 # [F1] Startup stale snapshot sweep — SIGKILL leaves .snap-recover files that EXIT trap cannot clean
 find /etc/transit_manager /etc/nginx /etc/systemd/system \
-  -maxdepth 5 -name '.snap-recover.*' -mtime +1 -delete 2>/dev/null || true
+  -maxdepth 5 -type f -name '.snap-recover.*' -mtime +1 -delete 2>/dev/null || true
 
 # BUG-02: 中断时清理 atomic_write 残留的临时文件及事务快照
 # v2.32 Gemini: 统一当次全清——操作锁保证同一时刻只有一个事务，快照不需要跨日保留
@@ -55,6 +79,8 @@ find /etc/transit_manager /etc/nginx /etc/systemd/system \
 # Broad /tmp scans risk touching unrelated user files; all scratch files are now under
 # ${MANAGER_BASE}/tmp so a targeted find there is sufficient and safe.
 _global_cleanup(){
+  # [R1 Fix] Guard: refuse to delete if MANAGER_BASE is unset or empty
+  [[ -n "${MANAGER_BASE:-}" && -d "$MANAGER_BASE" ]] || return 0
   find /etc/transit_manager /etc/nginx \
     /etc/systemd/system /etc/logrotate.d \
     -maxdepth 5 \
@@ -98,7 +124,7 @@ atomic_write()(
   local target="$1" mode="$2" owner_group="${3:-root:root}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir"
-  tmp="$(mktemp "$dir/.transit-mgr.XXXXXX")" \
+  tmp="$(mktemp "$dir/.transit-mgr.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
@@ -135,6 +161,7 @@ have_ipv6(){
 
 detect_ssh_port(){
   local p=""
+  command -v sshd >/dev/null 2>&1 || { echo "22"; return; }
   p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)"
   if [[ -z "${p:-}" ]]; then
     p="$(ss -H -tlnp 2>/dev/null | awk '
@@ -160,13 +187,14 @@ detect_ssh_port(){
       exit 1
     fi
   fi
-  printf '%s
-' "$p"
+  printf '%s\n' "$p"
 }
 
 validate_domain(){
   local d
   d="$(trim "$1")"
+  # [R22 Fix] Strip trailing dot (FQDN format) before validation
+  d="${d%.}"
   # RFC1035 长度守卫 + 必须含点
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
@@ -215,10 +243,13 @@ _meta_drift_detect(){
   local _mf _mdom _msafe _bad=0
   while IFS= read -r _mf; do
     [[ -f "$_mf" ]] || continue
-    _mdom=$(grep '^DOMAIN=' "$_mf" 2>/dev/null | cut -d= -f2- || true)
+    _mdom=$(grep '^DOMAIN=' "$_mf" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || true)
     [[ -n "$_mdom" ]] || continue
     _msafe=$(domain_to_safe "$_mdom")
     [[ -f "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
+    # [R5 Fix] Verify .map is non-empty and contains the domain (detect truncation/corruption)
+    [[ -s "${SNIPPETS_DIR}/landing_${_msafe}.map" ]] || { _bad=1; break; }
+    grep -qF "$_mdom" "${SNIPPETS_DIR}/landing_${_msafe}.map" 2>/dev/null || { _bad=1; break; }
   done < <(find "$CONF_DIR" -maxdepth 1 -type f -name '*.meta' 2>/dev/null | sort)
   return $_bad
 }
@@ -268,7 +299,9 @@ get_public_ip(){
   [[ "${1:-}" == "--strict" ]] && _strict=1
   local _ip=""
   local _src
-  for _src in     "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip"     "http://169.254.169.254/latest/meta-data/public-ipv4"     "https://api.ipify.org"     "https://ifconfig.me"     "https://ipecho.net/plain"     "https://checkip.amazonaws.com"; do
+  # [R-4] Restore default IFS (space/tab/newline) before iterating space-separated list
+  local IFS=$' \t\n'
+  for _src in     "https://api.ipify.org"     "https://ifconfig.me"     "https://checkip.amazonaws.com"     "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip"     "http://169.254.169.254/latest/meta-data/public-ipv4"     "https://ipecho.net/plain"; do
     if [[ "$_src" == *"metadata.google.internal"* ]]; then
       _ip=$(curl -4 -fsSL --connect-timeout 3 --max-time 5 --retry 2 -H "Metadata-Flavor: Google" "$_src" 2>/dev/null | tr -d '[:space:]') || true
     else
@@ -281,8 +314,15 @@ get_public_ip(){
     if (( _strict )); then
       die "无法获取中转机公网 IPv4，节点订阅无法生成。请检查网络或手动指定: TRANSIT_PUBLIC_IP=x.x.x.x bash $0 --import <token>"
     else
-      warn "无法获取中转机公网 IP，展示将使用占位符 <TRANSIT_IP>"
-      _ip="<TRANSIT_IP>"
+      warn "无法获取中转机公网 IPv4，尝试 IPv6..."
+      for _src in "https://api6.ipify.org" "https://ifconfig.me/ip"; do
+        _ip=$(curl -6 -fsSL --connect-timeout 3 --max-time 5 --retry 2 "$_src" 2>/dev/null | tr -d '[:space:]') || true
+        [[ -n "$_ip" ]] && { warn "检测到 IPv6 地址: $_ip（中转机架构仅支持 IPv4 中转，IPv6 落地机不受支持）"; break; }
+      done
+      if [[ -z "$_ip" ]]; then
+        warn "无法获取中转机公网 IP，展示将使用占位符 <TRANSIT_IP>"
+        _ip="<TRANSIT_IP>"
+      fi
     fi
   fi
   printf '%s' "$_ip"
@@ -309,7 +349,7 @@ check_deps(){
   fi
   local _bin_pkg=(
     curl:curl wget:wget iptables:iptables python3:python3
-    ip:${ip_pkg} nginx:nginx fuser:psmisc crontab:cron
+    ip:${ip_pkg} nginx:nginx fuser:psmisc
   )
   local missing_pkgs=()
   for bp in "${_bin_pkg[@]}"; do
@@ -380,18 +420,24 @@ net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_fastopen=3
 BBRCF2
-  echo "options nf_conntrack hashsize=262144" > /etc/modprobe.d/nf_conntrack.conf 2>/dev/null || true
-  modprobe nf_conntrack 2>/dev/null || true
+  # [R7 Fix] Defense-in-depth: protect against hardlink/symlink exploitation
+  cat >> "$bbr_conf" <<'BBRCF3'
+fs.protected_hardlinks=1
+fs.protected_symlinks=1
+BBRCF3
   # v2.42 Grok: conntrack hashsize 按内存动态计算（每条目~300B，用1/8内存）
- local _ct_mem; _ct_mem=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/8*1024*1024/300)}'); _ct_mem=${_ct_mem:-262144}
- [[ "$_ct_mem" =~ ^[0-9]+$ ]] || _ct_mem=262144
- (( _ct_mem < 131072 )) && _ct_mem=131072
- echo "$_ct_mem" > /sys/module/nf_conn
+  local _ct_mem; _ct_mem=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/8*1024*1024/300)}'); _ct_mem=${_ct_mem:-262144}
+  [[ "$_ct_mem" =~ ^[0-9]+$ ]] || _ct_mem=262144
+  (( _ct_mem < 131072 )) && _ct_mem=131072
+  atomic_write "/etc/modprobe.d/nf_conntrack.conf" 644 root:root <<MEOF
+options nf_conntrack hashsize=${_ct_mem}
+MEOF
+  modprobe nf_conntrack 2>/dev/null || true
+  echo "$_ct_mem" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
   # nf_conntrack_max 也动态设为 hashsize*4
   local _ct_max=$(( _ct_mem * 4 ))
   sysctl -w net.netfilter.nf_conntrack_max="${_ct_max}" &>/dev/null || true
-  sed -i "s/net.netfilter.nf_conntrack_max=.*/net.netfilter.nf_conntrack_max=${_ct_max}/" \
-    /etc/sysctl.d/99-transit-bbr.conf 2>/dev/null || true
+  sed -i "s/net.netfilter.nf_conntrack_max=.*/net.netfilter.nf_conntrack_max=${_ct_max}/"     /etc/sysctl.d/99-transit-bbr.conf 2>/dev/null || true
   sysctl --system &>/dev/null || true
   warn "sysctl 配置已重新加载；若需立即回收运行态内核资源，建议重启主机"
   sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -qi 'bbr' \
@@ -409,7 +455,7 @@ BBRCF2
 root soft nofile ${_fd_max}
 root hard nofile ${_fd_max}
 LIMEOF
-  success "内核网络参数已优化（conntrack hashsize=262144 / 拥塞控制权归 BBRPlus）"
+  success "内核网络参数已优化（conntrack hashsize=${_ct_mem} / 拥塞控制权归 BBRPlus）"
 }
 
 install_nginx(){
@@ -417,7 +463,7 @@ install_nginx(){
   # 必须强制安装 libnginx-mod-stream，不能仅靠 -V 输出判断
   if command -v nginx &>/dev/null; then
     # 已安装：测试 stream 指令是否真的可用（不只是 -V 标志）
-    if echo 'stream{}' | nginx -t -c /dev/stdin 2>/dev/null \
+    if echo 'events{} stream{}' | nginx -t -c /dev/stdin 2>/dev/null \
         || (nginx -V 2>&1 | grep -qE 'with-stream[^_]' \
            && dpkg -l libnginx-mod-stream 2>/dev/null | grep -q '^ii' 2>/dev/null); then
       success "Nginx 已安装且 stream 模块可用"
@@ -459,11 +505,11 @@ _tune_nginx_worker_connections(){
   local mc="$NGINX_MAIN_CONF"
   # [F4] Snapshot before sed mutations so nginx.conf can be restored on nginx -t failure
   # [v2.13 GPT-🟠] nginx.conf snapshot moved from /tmp to script-owned MANAGER_BASE/tmp
+  mkdir -p "${MANAGER_BASE}/tmp" || die "mkdir ${MANAGER_BASE}/tmp failed"
   local _mc_bak; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX" 2>/dev/null) \
-    || { mkdir -p "${MANAGER_BASE}/tmp"; _mc_bak=$(mktemp "${MANAGER_BASE}/tmp/.nginx-conf-snap.XXXXXX") \
-         || die "mktemp _mc_bak failed (disk full?) — cannot proceed without rollback capability"; }
-  [[ -n "$_mc_bak" ]] || die "mktemp returned empty path"
+    || die "mktemp _mc_bak failed (disk full?) — cannot proceed without rollback capability"
   cp -a "$mc" "$_mc_bak" || die "nginx.conf snapshot failed — cannot proceed without rollback capability"
+  [[ -n "$_mc_bak" ]] || die "mktemp returned empty path"
   local _mc_dirty=0
   # [v2.9 GPT-A-🟠] Recompute _fd_max here (same RAM×800 formula as optimize_kernel_network)
   # so worker_rlimit_nofile always matches the systemd LimitNOFILE drop-in value on this host.
@@ -474,17 +520,19 @@ _tune_nginx_worker_connections(){
   local _wc_ram; _wc_ram=$(free -m 2>/dev/null | awk '/Mem:/{print int($2/2*1000)}'); _wc_ram=${_wc_ram:-100000}
   (( _wc_ram < 10000 )) && _wc_ram=10000
   (( _wc_ram > 200000 )) && _wc_ram=200000
-  local _wc_val="$_wc_ram"
-  grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${VERSION}$" "$mc" 2>/dev/null || {
+  local _wc_val=$(( _wc_ram / $(nproc 2>/dev/null || echo 1) ))
+  local _wc_escaped="${VERSION//./\\.}"
+  _wc_escaped="${_wc_escaped//-/\-}"
+  grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
-      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)?/\1${_wc_val}\2 # transit-manager-tuning-v${VERSION}/" "$mc"
+      sed -i -E "s/^([[:space:]]*worker_connections[[:space:]]+)[0-9]+([[:space:]]*;.*)/\1${_wc_val}; # transit-manager-tuning-v${VERSION}/" "$mc"
     else
       sed -i "/^events\s*{/a\    worker_connections ${_wc_val}; # transit-manager-tuning-v${VERSION}" "$mc"
     fi
   }
   # Idempotent: strip any stale worker_rlimit_nofile line then re-inject current dynamic value
-  grep -qE "^worker_rlimit_nofile\s+${_tune_fd}\s*;[[:space:]]*# transit-manager-tuning-v${VERSION}$" "$mc" 2>/dev/null || {
+  grep -qE "^worker_rlimit_nofile\s+${_tune_fd}\s*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_rlimit_nofile' "$mc" 2>/dev/null; then
       sed -i "s/^[[:space:]]*worker_rlimit_nofile.*/worker_rlimit_nofile ${_tune_fd}; # transit-manager-tuning-v${VERSION}/" "$mc"
@@ -493,7 +541,7 @@ _tune_nginx_worker_connections(){
       info "worker_rlimit_nofile ${_tune_fd} 已写入 nginx.conf"
     fi
   }
-  grep -qE '^worker_shutdown_timeout\s+10m\s*;[[:space:]]*# transit-manager-tuning-v${VERSION}$' "$mc" 2>/dev/null || {
+  grep -qE "^worker_shutdown_timeout\s+10m\s*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_shutdown_timeout' "$mc" 2>/dev/null; then
       sed -i "s/^.*worker_shutdown_timeout.*/worker_shutdown_timeout 10m; # transit-manager-tuning-v${VERSION}/" "$mc"
@@ -537,7 +585,6 @@ UMask=0027
 StandardOutput=null
 StandardError=null
 SVCOV
-  # [F4] Hard-fail warning for nginx drop-in daemon-reload
   systemctl daemon-reload \
     || die "systemctl daemon-reload failed — drop-in limits will not apply (nginx may hit FD limit under load)"
   if systemctl is-active --quiet nginx 2>/dev/null; then
@@ -574,6 +621,8 @@ ${LOG_DIR}/*.log
 EOF
   # [v2.8 Gemini-Doc2-🟠] journald cap: transit nginx workers now log to journal; without a
   # size ceiling the default 1 GB cap on low-disk VPS can still fill and OOM-kill nginx workers.
+  # [REVIEWER-11] NOTE: purge_all() cleans this up comprehensively — removes the conf file
+  # then rmdir the parent dir if empty (lines 1686-1687).
   local _jd_conf="/etc/systemd/journald.conf.d/transit-manager.conf"
   mkdir -p "/etc/systemd/journald.conf.d"
   # Always rewrite so re-runs update the value if the file already exists from a prior version.
@@ -592,8 +641,9 @@ init_nginx_stream(){
   mkdir -p "$LOG_DIR"
   chown root:adm "$LOG_DIR" 2>/dev/null || true
   chmod 750 "$LOG_DIR"
-  mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
-  chmod 700 "$SNIPPETS_DIR"
+mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
+chmod 700 "$SNIPPETS_DIR"
+chmod 700 "$CONF_DIR"
   rm -f "${SNIPPETS_DIR}/landing_dummy.map" "${SNIPPETS_DIR}/landing_*.map.tmp" 2>/dev/null || true
 
   if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null; then
@@ -671,8 +721,10 @@ NGINX_STREAM_EOF
   local _mc_bak="${NGINX_MAIN_CONF}.transit.bak_$(date +%s)"
   cp -f "$NGINX_MAIN_CONF" "$_mc_bak" 2>/dev/null || true
   ls -t "${NGINX_MAIN_CONF}.transit.bak_"* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
-  local _mc_tmp; _mc_tmp=$(mktemp "${NGINX_MAIN_CONF%/*}/.snap-recover.XXXXXX") \
+  mkdir -p "${NGINX_MAIN_CONF%/*}" || die "mkdir nginx conf dir failed"
+  local _mc_tmp; _mc_tmp=$(mktemp "${NGINX_MAIN_CONF%/*}/.snap-recover.XXXXXX" 2>/dev/null) \
     || die "mktemp _mc_tmp failed"
+  [[ -n "$_mc_tmp" ]] || die "mktemp returned empty path"
   cp -f "$NGINX_MAIN_CONF" "$_mc_tmp" \
     || die "snapshot nginx.conf failed"
   printf '\n# %s\n' "$STREAM_INCLUDE_MARKER"  >> "$_mc_tmp"
@@ -691,7 +743,7 @@ NGINX_STREAM_EOF
       # v2.17: TFO降级原子化 - 失败时同时还原stream配置
       local _stream_bak="${NGINX_STREAM_CONF}.tfo.bak"
       cp -f "$NGINX_STREAM_CONF" "$_stream_bak" 2>/dev/null || true
-      sed -i -E 's/ fastopen=[0-9]+//; s/ so_keepalive=[^;]+//' "$NGINX_STREAM_CONF"
+      sed -i -E 's/ fastopen=[0-9]+//; s/ so_keepalive=[a-zA-Z0-9:]+//' "$NGINX_STREAM_CONF"
       if ! nginx -t 2>/dev/null; then
         nginx -t 2>&1 || true
         [[ -f "$_mc_bak" ]] && mv -f "$_mc_bak" "$NGINX_MAIN_CONF" 2>/dev/null || true
@@ -761,12 +813,6 @@ nginx_reload(){
   success "Nginx 热重载成功（零中断）"
 }
 
-# v2.34: Atomic chain purge - replaces line-number deletion
-_purge_chain_atomic() {
-  local chain="${1}" v="${2:-4}"
-  local cmd="${v}tables"
-  $cmd-save 2>/dev/null | grep -vF "${chain}" | $cmd-restore --noflush 2>/dev/null || true
-}
 
 setup_firewall_transit(){
   local ssh_port; ssh_port="$(detect_ssh_port)"
@@ -781,33 +827,20 @@ setup_firewall_transit(){
   # or leftover direct -j rules. Bulldozer reads iptables -S INPUT and removes every rule
   # that names FW_CHAIN or FW_TMP before attempting -F / -X / -E.
 _bulldoze_input_refs_t(){
-    local _chain="$1" _num _nums
-    # [v2.15.2] Delete by line number: re-fetch each pass and delete in descending order
-    # so iptables line-number shifts cannot corrupt the rule set.
-    while true; do
-      _nums=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null               | awk -v c="$_chain" 'NR>2 && $2 == c {print $1}'               | sort -nr)
-      [[ -n "${_nums:-}" ]] || break
-      while IFS= read -r _num; do
-        [[ -n "$_num" ]] || continue
-        iptables -w 2 -D INPUT "$_num" 2>/dev/null || break 2
-      done <<<"$_nums"
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      iptables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
   }
 
 _bulldoze_input_refs6_t(){
-    local _chain="$1" _num _nums
-    # [v2.15.2] Delete by line number: re-fetch each pass and delete in descending order
-    # so iptables line-number shifts cannot corrupt the rule set.
-    while true; do
-      _nums=$(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null               | awk -v c="$_chain" 'NR>2 && $2 == c {print $1}'               | sort -nr)
-      [[ -n "${_nums:-}" ]] || break
-      while IFS= read -r _num; do
-        [[ -n "$_num" ]] || continue
-        ip6tables -w 2 -D INPUT "$_num" 2>/dev/null || break 2
-      done <<<"$_nums"
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true
     done
   }
-
 
   _bulldoze_input_refs_t "$FW_CHAIN";  _bulldoze_input_refs_t "$FW_TMP"
   iptables -w 2 -F "$FW_TMP"   2>/dev/null || true; iptables -w 2 -X "$FW_TMP"   2>/dev/null || true
@@ -822,7 +855,8 @@ _bulldoze_input_refs6_t(){
   local _snap_persist=""
   local _persist_script="${MANAGER_BASE}/firewall-restore.sh"
   if [[ -f "$_persist_script" ]]; then
-    _snap_persist=$(mktemp "${MANAGER_BASE}/.transit-mgr.XXXXXX") \
+    mkdir -p "${MANAGER_BASE}" || die "mkdir ${MANAGER_BASE} failed"
+    _snap_persist=$(mktemp "${MANAGER_BASE}/.transit-mgr.XXXXXX" 2>/dev/null) \
       || die "mktemp _snap_persist failed — rollback snapshot unavailable"
     cp -f "$_persist_script" "$_snap_persist" \
       || die "snapshot persist script failed — rollback will be impaired"
@@ -833,21 +867,21 @@ _bulldoze_input_refs6_t(){
   _prev_int_trap=$(trap -p INT || true)
   _prev_term_trap=$(trap -p TERM || true)
   _fw_transit_rollback(){
-    # Atomic swap: remove INPUT ref -> swap chains -> cleanup
-    while iptables -w 2 -D INPUT -m comment --comment "transit-manager-swap" 2>/dev/null; do :; done
-    while iptables -w 2 -D INPUT -m comment --comment "transit-manager-rule" 2>/dev/null; do :; done
-    while ip6tables -w 2 -D INPUT -m comment --comment "transit-manager-v6-swap" 2>/dev/null; do :; done
-    while ip6tables -w 2 -D INPUT -m comment --comment "transit-manager-v6-jump" 2>/dev/null; do :; done
-    iptables -w 2 -E "FWDUMMY" "${FW_CHAIN}_OLD" 2>/dev/null || true
-    iptables -w 2 -E "${FW_CHAIN}" "FWDUMMY" 2>/dev/null || true
-    iptables -w 2 -E "${FW_CHAIN}_OLD" "${FW_CHAIN}" 2>/dev/null || true
-    iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true
-    iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
-    ip6tables -w 2 -E "FWDUMMY6" "${FW_CHAIN6}_OLD" 2>/dev/null || true
-    ip6tables -w 2 -E "${FW_CHAIN6}" "FWDUMMY6" 2>/dev/null || true
-    ip6tables -w 2 -E "${FW_CHAIN6}_OLD" "${FW_CHAIN6}" 2>/dev/null || true
-    ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true
-    ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
+    # Fail-closed rollback: remove ALL chain refs from INPUT, flush all temp chains
+    # Before this fix: FW_TMP remained referenced if rollback fired after line 934 but before line 940
+    local _n
+    # Remove FW_CHAIN/OLD and FW_TMP refs from INPUT (fail closed — chains may not exist)
+    for _c in "${FW_CHAIN}_OLD" "$FW_CHAIN" "${FW_TMP}" "${FW_CHAIN6}_OLD" "$FW_CHAIN6" "${FW_TMP6}"; do
+      mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+      mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+    done
+    # Flush and delete all temp chains (ignore errors — chains may already be gone)
+    iptables -w 2 -F "${FW_TMP}"  2>/dev/null || true; iptables -w 2 -X "${FW_TMP}"  2>/dev/null || true
+    iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true; iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
+    ip6tables -w 2 -F "${FW_TMP6}"  2>/dev/null || true; ip6tables -w 2 -X "${FW_TMP6}"  2>/dev/null || true
+    ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true; ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
     # v2.36 GPT: 区分"有旧快照"和"首次安装无旧文件"两种情形
     if [[ -n "${_snap_persist:-}" && -f "${_snap_persist:-}" ]]; then
       # 存在旧快照 → 还原
@@ -888,37 +922,64 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT"              -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP"                                              -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-swap" -j "$FW_TMP"
-  # [v2.15] Bulldozer drain before rename: removes every INPUT rule referencing FW_CHAIN
+  # [R-8 FIX] Bulldozer runs AFTER chain is fully populated (post line 891), BEFORE rename:
+  # removes stale INPUT rules referencing old FW_CHAIN before atomic swap
   _bulldoze_input_refs_t "$FW_CHAIN"
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN"
-  iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-rule" -j "$FW_CHAIN"
-  while iptables -w 2 -D INPUT -m comment --comment "transit-manager-swap" 2>/dev/null; do :; done
-
-  if have_ipv6; then
-    ip6tables -w 2 -N "$FW_TMP6" 2>/dev/null || ip6tables -w 2 -F "$FW_TMP6"
-    ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    ip6tables -w 2 -A "$FW_TMP6" -i lo -j ACCEPT
-    ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$ssh_port"    -j ACCEPT
-    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-icmp6" -j ACCEPT
-    ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
-    # v2.43 Grok: IPv6 加 connlimit+rate，与 IPv4 对等防护（/64 对应 IPv6 CGNAT 粒度）
-    ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-      -m connlimit --connlimit-above 2000 --connlimit-mask 64  -j DROP
-    ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-      -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
-    ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-      -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
-    ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT"      -j DROP
-    ip6tables -w 2 -A "$FW_TMP6" -j DROP
-    ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-swap" -j "$FW_TMP6"
-    # [v2.15] Bulldozer drain for IPv6 before rename
-    _bulldoze_input_refs6_t "$FW_CHAIN6"
-    ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
-    ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6"
-    ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-jump" -j "$FW_CHAIN6"
-    while ip6tables -w 2 -D INPUT -m comment --comment "transit-manager-v6-swap" 2>/dev/null; do :; done
+  # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
+  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" || {
+    _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
+  }
+  # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion: line 935 was redundant.
+  # After the atomic swap above, FW_CHAIN is already at INPUT position 1
+  # (the swap inserted it there; rename doesn't change position).
+  # Line 935 inserted a second jump to the same chain, creating a duplicate.
+  # Position check below verifies FW_CHAIN is at position 1.
+  # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
+  local _actual_pos
+  _actual_pos=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1; exit}')
+  if [[ "${_actual_pos:-}" != "1" ]]; then
+    warn "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），可能与其他服务冲突"
   fi
+  local _n
+  mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP" '$2==c {print $1}' | sort -rn)
+  for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+
+    if have_ipv6; then
+      ip6tables -w 2 -N "$FW_TMP6" 2>/dev/null || ip6tables -w 2 -F "$FW_TMP6"
+      # [F4 Fix] Mirror IPv4 rule order: lo → SSH → INVALID DROP → ESTABLISHED → ICMP → 443
+      ip6tables -w 2 -A "$FW_TMP6" -i lo -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$ssh_port"    -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate INVALID,UNTRACKED -j DROP
+      ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      # [R4 Fix] Accept critical ICMPv6 for PMTUD (type 2), dest-unreachable (1), time-exceeded (3), param-problem (4) — required for IPv6 connectivity
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "transit-manager-icmp6-pmtud" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
+      # v2.43 Grok: IPv6 加 connlimit+rate，与 IPv4 对等防护（/64 对应 IPv6 CGNAT 粒度）
+      ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
+        -m connlimit --connlimit-above 2000 --connlimit-mask 64  -j DROP
+      ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
+        -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
+      ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
+        -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
+      ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT"      -j DROP
+      ip6tables -w 2 -A "$FW_TMP6" -j DROP
+      ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-swap" -j "$FW_TMP6"
+      # [v2.15] Bulldozer drain for IPv6 before rename
+      _bulldoze_input_refs6_t "$FW_CHAIN6"
+      ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
+ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" || { _fw_transit_rollback; _restore_prev_traps; die "IPv6 chain rename failed"; }
+# [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion for IPv6 (same as line 935 fix)
+      local _n
+      mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP6" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+      mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN6" '$2==c {print $1}' | sort -rn)
+      for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+    fi
 
   # v2.37 GPT: trap 保持活跃直到 _persist_iptables 成功，防运行链/开机链分裂
   # 旧代码在此处提前 trap - ERR INT TERM，导致 persist 失败时无法回滚
@@ -935,6 +996,12 @@ trap '_fw_transit_rollback; exit 130' INT TERM
 
 _persist_iptables(){
   local ssh_port="${1:-22}"
+  # [R6 Fix] Validate ssh_port is numeric before template injection
+  [[ "$ssh_port" =~ ^[0-9]+$ ]] || die "SSH 端口非法（需为数字）: $ssh_port"
+  (( ssh_port >= 1 && ssh_port <= 65535 )) || die "SSH 端口超范围 (1-65535): $ssh_port"
+  # [R22 Fix] Validate FW_CHAIN names contain only safe characters before template injection
+  [[ "$FW_CHAIN" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN 含非法字符: $FW_CHAIN"
+  [[ "$FW_CHAIN6" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN6 含非法字符: $FW_CHAIN6"
   mkdir -p "$MANAGER_BASE"
   local fw_script="${MANAGER_BASE}/firewall-restore.sh"
   local _fw_sig="TRANSIT_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
@@ -943,7 +1010,8 @@ _persist_iptables(){
 from pathlib import Path
 import os, sys
 
-template = r"""#!/bin/sh
+template = r"""#!/usr/bin/env bash
+[[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { echo "ERROR: Bash 4+ required"; exit 1; }
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # __FW_SIG__
 # 🟠 Grok: SSH 端口在恢复时动态探测，防止用户修改 sshd 端口后重启丢失 SSH
@@ -958,8 +1026,11 @@ _detect_ssh(){
       gsub(/\]$/,"",addr)
       if (addr ~ /^[0-9]+$/) { print addr; exit }
     }' || true)"
-  if echo "$p" | grep -qE '^[0-9]+$' && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]; then
-    echo "$p"
+  # [R12 Fix] sshd not running at boot → fall back to sshd_config before using install-time value
+  [ -z "$p" ] && p="$(grep -RhsE '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d 2>/dev/null | awk '{print $2}' | sort -n | head -1 || true)"
+  _ssh_port="${p:-}"; [[ -z "$_ssh_port" || "$_ssh_port" == "0" ]] && _ssh_port=__SSH_PORT__
+  if echo "$_ssh_port" | grep -qE '^[0-9]+$' && [ "$_ssh_port" -ge 1 ] && [ "$_ssh_port" -le 65535 ]; then
+    echo "$_ssh_port"
   else
     logger -t transit-firewall "WARN: 无法动态探测 SSH 端口，使用安装时值 __SSH_PORT__"
     echo "__SSH_PORT__"
@@ -979,8 +1050,22 @@ iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit -
 iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit             -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__                                                         -m comment --comment "transit-manager-rule" -j DROP
 iptables -w 2 -A __FW_CHAIN__-NEW                                              -m comment --comment "transit-manager-rule" -j DROP
-while iptables -w 2  -D INPUT -m comment --comment "transit-manager-rule" 2>/dev/null; do :; done
-while iptables -w 2  -D INPUT -m comment --comment "transit-manager-swap" 2>/dev/null; do :; done
+_bulldoze_input_refs(){
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      iptables -w 2 -D INPUT "$_n" 2>/dev/null || true
+    done
+  }
+_bulldoze_input_refs6(){
+    local _chain="$1" _lines _n
+    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
+    for _n in "${_lines[@]}"; do
+      ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true
+    done
+  }
+_bulldoze_input_refs __FW_CHAIN__
+_bulldoze_input_refs6 __FW_CHAIN6__
 iptables -w 2 -F __FW_CHAIN__  2>/dev/null || true
 iptables -w 2 -X __FW_CHAIN__  2>/dev/null || true
 iptables -w 2 -E __FW_CHAIN__-NEW __FW_CHAIN__ 2>/dev/null || {
@@ -992,18 +1077,28 @@ iptables -w 2 -I INPUT 1 -m comment --comment "transit-manager-rule" -j __FW_CHA
 if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6tables -nL >/dev/null 2>&1 && [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" != "1" ]; then
   ip6tables -w 2 -N __FW_CHAIN6__-NEW 2>/dev/null || true
   ip6tables -w 2 -F __FW_CHAIN6__-NEW 2>/dev/null || true
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  # [F4 Fix] Mirror IPv4 order: lo → SSH → INVALID DROP → ESTABLISHED → ICMP → 443
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -i lo -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp      --dport ${SSH_PORT}      -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate INVALID,UNTRACKED -j DROP
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  # [R4 Fix] Accept critical ICMPv6 for PMTUD + routing control
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "transit-manager-icmp6-pmtud" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 64 -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6 -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -j DROP
-  while ip6tables -w 2 -D INPUT -m comment --comment "transit-manager-v6-jump" 2>/dev/null; do :; done
-  while ip6tables -w 2 -D INPUT -m comment --comment "transit-manager-v6-swap" 2>/dev/null; do :; done
+  local _n
+  mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="__FW_CHAIN6__-NEW" '$2==c {print $1}' | sort -rn)
+  for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
+  mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="__FW_CHAIN6__" '$2==c {print $1}' | sort -rn)
+  for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
   ip6tables -w 2 -F __FW_CHAIN6__ 2>/dev/null || true
   ip6tables -w 2 -X __FW_CHAIN6__ 2>/dev/null || true
   ip6tables -w 2 -E __FW_CHAIN6__-NEW __FW_CHAIN6__ 2>/dev/null || {
@@ -1028,7 +1123,6 @@ PY
 [Unit]
 Description=Restore iptables rules for transit-manager
 DefaultDependencies=no
-After=network-online.target netfilter-persistent.service ufw.service firewalld.service
 Before=network-pre.target
 Wants=network-pre.target
 
@@ -1048,31 +1142,6 @@ RSTO
   info "防火墙规则已写入: ${fw_script}（开机动态检测 SSH 端口，have_ipv6 守卫 ip6tables）"
 }
 
-save_landing_meta(){
-  local domain="$1" ip="$2" port="${3:-443}" rollback_map="${4:-}"
-  local safe; safe=$(domain_to_safe "$domain")
-  mkdir -p "$CONF_DIR"
-  # [F2] Field name unified to TRANSIT_IP= (was IP=) to match landing nodes/*.conf schema.
-  # read_meta_ip() below accepts both old and new format for backwards compatibility.
-  if ! atomic_write "${CONF_DIR}/${safe}.meta" 600 root:root <<MEOF
-DOMAIN=${domain}
-TRANSIT_IP=${ip}
-PORT=${port}
-CREATED=$(date +%Y%m%d_%H%M%S)
-MEOF
-  then
-    # meta 写失败：回滚已生效的 .map（恢复旧备份或删除新增）
-    if [[ -n "$rollback_map" && -f "$rollback_map" ]]; then
-      mv -f "$rollback_map" "${SNIPPETS_DIR}/landing_${safe}.map" 2>/dev/null || true
-    else
-      rm -f "${SNIPPETS_DIR}/landing_${safe}.map" 2>/dev/null || true
-    fi
-    # 🔴 Grok: .map 已回滚，必须同步回滚 nginx 运行态，否则运行态与文件态分裂
-    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-    die "meta 写入失败，.map 及 Nginx 运行态已回滚（真相源未分裂）"
-  fi
-  rm -f "$rollback_map" 2>/dev/null || true
-}
 
 # v2.35 Grok: 原子提交路由（map + meta + nginx reload 三合一）
 # 正常路径: snapshot → write_map → nginx-t → reload → mv_meta → clean
@@ -1081,9 +1150,10 @@ MEOF
 _atomic_apply_route(){
   # ARCH-2 FIX: 新增 uuid/pwd/pfx 三个参数；meta 存储全量字段供 generate_nodes() 使用
   # v2.39: 先定义函数再注册trap，防止ERR触发时函数未定义
+  # [R1 Fix] Use exported global vars so rollback works when ERR fires from subshell
   _route_rollback(){
-    local _map_target="${map_target:-}" _meta_target="${meta_target:-}"
-    local _snap_map_path="${_snap_map:-}" _snap_meta_path="${_snap_meta:-}"
+    local _map_target="${_ROUTE_MAP_TARGET:-}" _meta_target="${_ROUTE_META_TARGET:-}"
+    local _snap_map_path="${_ROUTE_SNAP_MAP:-}" _snap_meta_path="${_ROUTE_SNAP_META:-}"
     if [[ -n "$_snap_map_path" && -f "$_snap_map_path" && -n "$_map_target" ]]; then
       mv -f "$_snap_map_path" "$_map_target" 2>/dev/null || true
     elif [[ -n "$_map_target" ]]; then
@@ -1101,9 +1171,19 @@ _atomic_apply_route(){
     fi
     rm -f "${_snap_map:-}" "${_snap_meta:-}" 2>/dev/null || true
   }
-  trap '_route_rollback; exit 130' INT TERM ERR
+  trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
   local domain="$1" ip="$2" port="$3"
   local uuid="${4:-}" pwd="${5:-}" pfx="${6:-}"
+  # [R3 Fix] Validate uuid/pwd/pfx are non-empty for token-import mode
+  # v3.64: Manual add_landing_route passes empty strings — skip validation, allow partial route
+  #        Token import path (import_token) always provides all 6 params so this still validates
+  if [[ -z "$uuid" || -z "$pwd" || -z "$pfx" ]]; then
+    : # manual mode — uuid/pwd/pfx may be absent, only write routing (no subscription)
+  else
+    [[ "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+      || die "Token 中 uuid 格式非法（需为标准 UUID 格式）"
+    [[ ${#pwd} -ge 16 ]] || die "Token 中密码过短（需 ≥16 字符）"
+  fi
   local safe; safe=$(domain_to_safe "$domain")
   [[ -n "$safe" ]] || die "域名 safe 转换后为空: ${domain}"
 
@@ -1129,6 +1209,10 @@ _atomic_apply_route(){
     cp -f "$meta_target" "$_snap_meta" \
       || die "snapshot meta_target failed"
   fi
+  # [R1 Fix] Export globals BEFORE trap fires — ERR trap runs in subshell where
+  # local vars are out of scope. Rollback must read stable global copies.
+  export _ROUTE_MAP_TARGET="$map_target" _ROUTE_META_TARGET="$meta_target"
+  export _ROUTE_SNAP_MAP="$_snap_map" _ROUTE_SNAP_META="$_snap_meta"
 
   # 2. 写新 .map（原子 mv 到正式路径供 nginx -t）
   local tmp_map; tmp_map=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
@@ -1136,9 +1220,12 @@ _atomic_apply_route(){
   local _map_key; _map_key=$(nginx_domain_str "$domain")
   [[ -n "$_map_key" && ${#_map_key} -le 200 ]] \
     || { rm -f "$tmp_map" 2>/dev/null; die "域名过滤后为空或超长，拒绝写入 map: ${domain}"; }
-  printf '    %s    %s:%s;\n' "$_map_key" "$(nginx_ip_str "$ip")" "$port" > "$tmp_map"
-  chmod 600 "$tmp_map"
-  mv -f "$tmp_map" "$map_target"
+  printf '    %s    %s:%s;\n' "$_map_key" "$(nginx_ip_str "$ip")" "$port" > "$tmp_map" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "写入 map 临时文件失败（磁盘满？）"; }
+  chmod 600 "$tmp_map" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "chmod tmp_map failed"; }
+  mv -f "$tmp_map" "$map_target" \
+    || { rm -f "$tmp_map" 2>/dev/null; die "atomic mv tmp_map → $map_target failed"; }
   chmod 600 "$map_target" 2>/dev/null || true
 
   local _prev_route_err_trap _prev_route_int_trap _prev_route_term_trap
@@ -1146,11 +1233,23 @@ _atomic_apply_route(){
   _prev_route_int_trap=$(trap -p INT || true)
   _prev_route_term_trap=$(trap -p TERM || true)
   _restore_prev_route_traps(){
-    eval "${_prev_route_err_trap:-trap - ERR}"
-    eval "${_prev_route_int_trap:-trap - INT}"
-    eval "${_prev_route_term_trap:-trap - TERM}"
+    if [[ -n "${_prev_route_err_trap:-}" ]]; then
+      eval "$_prev_route_err_trap" || trap - ERR
+    else
+      trap - ERR
+    fi
+    if [[ -n "${_prev_route_int_trap:-}" ]]; then
+      eval "$_prev_route_int_trap" || trap - INT
+    else
+      trap - INT
+    fi
+    if [[ -n "${_prev_route_term_trap:-}" ]]; then
+      eval "$_prev_route_term_trap" || trap - TERM
+    else
+      trap - TERM
+    fi
   }
-  trap '_route_rollback; exit 130' INT TERM ERR
+  trap '_route_rollback; _restore_prev_route_traps; exit 1' INT TERM ERR
 
   # 3. nginx -t 验证
   if ! nginx -t 2>/dev/null; then
@@ -1162,11 +1261,16 @@ _atomic_apply_route(){
   # old map (which we will roll back); prevents truth-source split where nginx routes new IP
   # but .meta is missing. Old order (reload→meta) left a window where nginx served new IP
   # with no truth record on disk-full or permission error.
+  # [F3] Collision check: prevent overwriting .meta belonging to a different domain
+  local _existing_dom=""; [[ -f "$meta_target" ]] && _existing_dom=$(grep '^DOMAIN=' "$meta_target" 2>/dev/null | cut -d= -f2); [[ -n "$_existing_dom" && "$_existing_dom" != "$domain" ]] && die "Filename collision: $safe already used by $_existing_dom"
+
   local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
     || die "mktemp tmp_meta failed"
   printf 'DOMAIN=%s\nTRANSIT_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
-    "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta"
-  chmod 600 "$tmp_meta"
+    "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta" \
+    || { rm -f "$tmp_meta" 2>/dev/null; die "写入 meta 临时文件失败（磁盘满？）"; }
+  chmod 600 "$tmp_meta" \
+    || { rm -f "$tmp_meta" 2>/dev/null; die "chmod tmp_meta failed"; }
   if ! mv -f "$tmp_meta" "$meta_target"; then
     rm -f "$tmp_meta" 2>/dev/null || true
     _route_rollback; _restore_prev_route_traps
@@ -1192,10 +1296,10 @@ list_landings(){
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local dom ip ts port
-    dom=$(grep '^DOMAIN='  "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
+    dom=$(grep '^DOMAIN='  "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
     ip=$(read_meta_ip "$meta" 2>/dev/null) || ip="?"
-    port=$(grep '^PORT='   "$meta" 2>/dev/null | cut -d= -f2-) || port=443
-    ts=$(grep  '^CREATED=' "$meta" 2>/dev/null | cut -d= -f2- || echo "?")
+    port=$(grep '^PORT='   "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || port=443
+    ts=$(grep  '^CREATED=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}' || echo "?")
     printf "  [%d] %-38s → %-20s :%s  创建: %s\n" $((++n)) "$dom" "$ip" "$port" "$ts"
   done < <(find "$CONF_DIR" -name "*.meta" -type f 2>/dev/null | sort)
   [[ $n -eq 0 ]] && warn "（暂无已配置落地机）"
@@ -1210,17 +1314,24 @@ generate_nodes(){
     # NAT / 共享出口场景允许占位符输出，便于用户先拿到可继续导入的订阅模板
     transit_ip=$(get_public_ip)
   fi
+  # [R2 Fix] Validate transit_ip before using it in Python URI generation
+  if [[ "$transit_ip" != "<TRANSIT_IP>" ]]; then
+    validate_ip "$transit_ip" 2>/dev/null || {
+      warn "中转机 IP 格式非法: $transit_ip，跳过节点生成"
+      return 1
+    }
+  fi
 
   local any=0
   while IFS= read -r meta; do
     [[ -f "$meta" ]] || continue
     local dom ip port uuid pwd pfx
-    dom=$(grep  '^DOMAIN=' "$meta" 2>/dev/null | cut -d= -f2-) || continue
+    dom=$(grep  '^DOMAIN=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || continue
     ip=$(read_meta_ip "$meta" 2>/dev/null) || continue
-    port=$(grep '^PORT='   "$meta" 2>/dev/null | cut -d= -f2-) || port=443
-    uuid=$(grep '^UUID='   "$meta" 2>/dev/null | cut -d= -f2-) || uuid=""
-    pwd=$(grep  '^PWD='    "$meta" 2>/dev/null | cut -d= -f2-)  || pwd=""
-    pfx=$(grep  '^PFX='    "$meta" 2>/dev/null | cut -d= -f2-)  || pfx=""
+    port=$(grep '^PORT='   "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || port=443
+    uuid=$(grep '^UUID='   "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || uuid=""
+    pwd=$(grep  '^PWD='    "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')  || pwd=""
+    pfx=$(grep  '^PFX='    "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}')  || pfx=""
     [[ -n "$dom" && -n "$ip" ]] || continue
 
     if [[ -z "$uuid" || -z "$pwd" || -z "$pfx" ]]; then
@@ -1239,7 +1350,6 @@ generate_nodes(){
     _tmp=$(mktemp) || return 1
     printf '%s\n' "$transit_ip" "$dom" "$uuid" "$pwd" "$pfx" > "$_tmp"
     sub_b64=$(python3 - "$_tmp" 2>&1) || { _sub_err="$sub_b64"; sub_b64=""; }
-    rm -f "$_tmp"
 
     python3 - "$_tmp" >/dev/null 2>&1 <<'PYGEN'
 import base64, urllib.parse, sys
@@ -1257,6 +1367,7 @@ uris = [
 ]
 print(base64.b64encode('\n'.join(uris).encode()).decode())
 PYGEN
+    rm -f "$_tmp"
 
     if [[ -n "$sub_b64" ]]; then
       echo -e "  ${BOLD}Base64 订阅（粘贴到客户端「添加订阅」）:${NC}"
@@ -1292,7 +1403,7 @@ import json
 import re
 import sys
 raw = sys.stdin.read().strip()
-m = re.search(r'(?<![A-Za-z0-9+/=])(?:eyJ|ey A)[A-Za-z0-9+/=]{20,}(?![A-Za-z0-9+/=])', raw)
+m = re.search(r'(?<![A-Za-z0-9+/=])(?:eyJ|eyA)[A-Za-z0-9+/=]{20,}(?![A-Za-z0-9+/=])', raw)
 if not m:
     m = re.search(r'(?<![A-Za-z0-9+/=])[A-Za-z0-9+/=]{40,}(?![A-Za-z0-9+/=])', raw)
 if not m:
@@ -1326,10 +1437,28 @@ print(decoded)
     warn "Token 中缺少 uuid/pwd/pfx（旧版 Token），只能导入路由，无法生成完整节点订阅"
     warn "  → 请重新在落地机执行 print_pairing_info 生成新版 Token"
   fi
+  # [R-24 FIX] Validate UUID format and password minimum length if present
+  if [[ -n "$uuid" && ! "$uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    die "Token 中 uuid 格式非法（需为标准 UUID 格式）"
+  fi
+  if [[ -n "$pwd" && ${#pwd} -lt 16 ]]; then
+    die "Token 中密码过短（需 ≥16 字符）"
+  fi
 
   validate_ip     "$ip"
   dom=$(trim "$dom")
   validate_domain "$dom"
+  # [R8 Fix] Check for existing domain with different IP before overwrite
+  local _existing_node
+  _existing_node=$(find "$CONF_DIR" -name "*.meta" -type f -exec grep -l "^DOMAIN=${dom}$" {} + 2>/dev/null | head -1)
+  if [[ -n "$_existing_node" ]]; then
+    local _existing_ip
+    _existing_ip=$(read_meta_ip "$_existing_node" 2>/dev/null)
+    if [[ "$_existing_ip" != "$ip" ]]; then
+      die "域名 ${dom} 已存在于节点文件 ${_existing_node}（落地机IP: ${_existing_ip}），不能用不同的落地机IP重复导入"
+    fi
+    warn "域名 ${dom} 已存在，将更新现有配置"
+  fi
   # v2.32 Grok: 硬截断防超长域名绕过 map 语法校验
   dom="${dom:0:253}"
   # 🔴 Grok: nginx_domain_str 过滤后若为空（含纯控制字符域名），拒绝生成 map
@@ -1337,9 +1466,12 @@ print(decoded)
   [[ -n "$_safe_check" ]] || die "域名过滤后为空（含非法字符），拒绝写入 map: ${dom}"
   info "导入路由规则: ${dom} → ${ip}:${port}"
 
-  if [[ ! -f "$INSTALLED_FLAG" ]]; then
+  if [[ ! -f "$INSTALLED_FLAG" && "${__TRANSIT_FRESH_INSTALL_TRAP_ACTIVE:-0}" == "0" ]]; then
     info "--import 触发首次安装初始化 ..."
-    ss -tlnp 2>/dev/null | grep -q ':443 ' && die "443 端口已被占用！请先停止冲突服务后再安装（建议先执行 systemctl stop nginx xray* mack-a*）"
+    if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
+      warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
+    fi
+    ss -tlnp 2>/dev/null | grep -q ":443 " && die "443 端口已被占用！请先停止冲突服务后再安装（建议先执行 systemctl stop nginx xray* mack-a*）"
 
     # [v2.8 GPT-Doc2-🔴] Trap registered BEFORE the first side-effect write (check_deps).
     # v2.7 registered it after the 443 check but before check_deps; if apt-get update failed
@@ -1373,15 +1505,15 @@ print(decoded)
       || die "Nginx 启动失败（systemctl start 返回非零，已触发回滚）"
     mkdir -p "$MANAGER_BASE"
 
-    __TRANSIT_IMPORT_TRAP_ACTIVE=0
-    trap '_global_cleanup; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM ERR
     # [F1] INSTALLED_FLAG must be committed AFTER _atomic_apply_route, not before.
   fi
 
   # ARCH-2: 传入 uuid/pwd/pfx，meta 中持久化；generate_nodes() 读取后生成完整订阅
-  _atomic_apply_route "$dom" "$ip" "$port" "$uuid" "$pwd" "$pfx"
+  _atomic_apply_route "$dom" "$ip" "$port" "$uuid" "$pwd" "$pfx" || die "Route application failed"
   # Commit install marker only after route is durably applied
   [[ -f "$INSTALLED_FLAG" ]] || touch "$INSTALLED_FLAG"
+  __TRANSIT_IMPORT_TRAP_ACTIVE=0
+  trap '_global_cleanup; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM ERR
   success "路由规则导入完成: SNI=${dom} → ${ip}:${port}"
   echo ""
   echo -e "${BOLD}── 导入成功——生成完整节点订阅 ─────────────────────────────────${NC}"
@@ -1434,11 +1566,13 @@ add_landing_route(){
   if [[ -f "${SNIPPETS_DIR}/landing_${safe}.map" ]]; then
     _old_bak=$(mktemp "${SNIPPETS_DIR}/.snap-recover.XXXXXX") \
       || die "mktemp _old_bak failed"
+    [[ -n "$_old_bak" ]] || die "mktemp returned empty path"
     cp -f "${SNIPPETS_DIR}/landing_${safe}.map" "$_old_bak" 2>/dev/null || _old_bak=""
   fi
 
   # v2.35 Grok: _atomic_apply_route 内部自管快照，外部 _old_bak 仍保留供 SIGINT 清理
-  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN"
+  # v3.64: 手动模式不传 uuid/pwd/pfx，_atomic_apply_route 允许空值（仅写路由，无节点订阅）
+  _atomic_apply_route "$LANDING_DOMAIN" "$LANDING_IP" "$LANDING_PORT_IN" "" "" ""
   rm -f "$_old_bak" 2>/dev/null || true
   _release_lock
   success "路由规则已生效: SNI=${LANDING_DOMAIN} → ${LANDING_IP}:${LANDING_PORT_IN}"
@@ -1460,7 +1594,7 @@ delete_landing_route(){
     while IFS= read -r meta; do
       (( ++n ))
       if (( n == DEL_DOMAIN )); then
-        matched=$(grep '^DOMAIN=' "$meta" 2>/dev/null | cut -d= -f2-) || true; break
+        matched=$(grep '^DOMAIN=' "$meta" 2>/dev/null | awk -F= '{sub(/^[^=]*=/,"",$0); print}') || true; break
       fi
     done < <(find "$CONF_DIR" -name "*.meta" -type f 2>/dev/null | sort)
     [[ -n "$matched" ]] || { _release_lock; die "编号 ${DEL_DOMAIN} 不存在"; }
@@ -1550,8 +1684,8 @@ show_status(){
       || { echo -e "  ${RED}INVALID DROP:    ✗ 规则缺失（执行 --import 或重装以修复）${NC}"; _ok=0; }
     # proxy_timeout 文件态 vs nginx 运行态对比
     local _rscript_pt _live_pt
-    _rscript_pt=$(grep -oP 'proxy_timeout\s+\K[0-9]+' "$NGINX_STREAM_CONF" 2>/dev/null | head -1 || echo "")
-    _live_pt=$(nginx -T 2>/dev/null | grep -oP 'proxy_timeout\s+\K[0-9]+' | head -1 || echo "")
+    _rscript_pt=$(grep -oE 'proxy_timeout[[:space:]]+[0-9]+' "$NGINX_STREAM_CONF" 2>/dev/null | awk '{print $2}' | head -1 || echo "")
+    _live_pt=$(nginx -T 2>/dev/null | grep -oE 'proxy_timeout[[:space:]]+[0-9]+' | awk '{print $2}' | head -1 || echo "")
     if [[ -n "$_rscript_pt" && "$_rscript_pt" != "$_live_pt" ]]; then
       # v2.40 GPT #5: --status 是只读巡检，不执行写操作；漂移只报红，修复用独立命令
       echo -e "  ${RED}恢复脚本存在:    ✗ proxy_timeout 与运行态不一致（需手动修复）${NC}"; _ok=0
@@ -1622,7 +1756,10 @@ purge_all(){
     fi
   else
     warn "nginx -t 失败（配置已删除），尝试直接重启..."
-    systemctl restart nginx 2>/dev/null || warn "nginx 重启失败，请手动处理"
+    if ! systemctl restart nginx 2>/dev/null; then
+      error "nginx 重启失败！请手动修复 /etc/nginx/nginx.conf 后执行: systemctl start nginx"
+      die "卸载中止：nginx 配置损坏，请手动修复"
+    fi
   fi
 
   rm -f "/etc/systemd/system/nginx.service.d/transit-manager-override.conf" 2>/dev/null || true
@@ -1676,11 +1813,15 @@ _purge_bulldoze6(){
   # iptables-save > /etc/iptables/rules.v4 已移除
 
   rm -f /etc/sysctl.d/99-transit-bbr.conf /etc/modprobe.d/nf_conntrack.conf 2>/dev/null || true
+  # [R9 Fix] Verify sysctl file deletion and reload sysctl to revert settings
+  if [[ -f /etc/sysctl.d/99-transit-bbr.conf ]]; then
+    warn "无法删除 /etc/sysctl.d/99-transit-bbr.conf（可能是只读文件系统），请手动删除"
+  fi
   sysctl --system &>/dev/null || true
   sed -i '/# xray-transit: raised for high-concurrency/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
   rm -f /var/run/transit-manager.update.warn 2>/dev/null || true
   rm -f /etc/systemd/journald.conf.d/transit-manager.conf 2>/dev/null || true
-  rmdir "/etc/systemd/journald.conf.d" 2>/dev/null || true
+  [[ -z "$(ls -A /etc/systemd/journald.conf.d 2>/dev/null)" ]] && rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
   systemctl restart systemd-journald 2>/dev/null || true
   rm -f "$LOGROTATE_FILE" 2>/dev/null || true
   # v2.32 Gemini: 卸载时清除日志目录，防止重装后僵尸日志污染
@@ -1764,7 +1905,10 @@ fresh_install(){
   # 判断逻辑：
   #   ① nginx 占 443 + stream include 存在 → 本脚本半装，stop nginx 后继续重装
   #   ② 其他进程占 443 → 真正冲突，die 要求用户手动处理
-  if ss -tlnp 2>/dev/null | grep -q ':443 '; then
+  if ss -tlnp 2>/dev/null | grep -q ":443 "; then
+    if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
+      warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
+    fi
     if systemctl is-active --quiet nginx 2>/dev/null \
         && grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null; then
       warn "检测到本脚本半安装状态（nginx 占 443 + stream include 存在）"
@@ -1772,8 +1916,8 @@ fresh_install(){
       systemctl stop nginx 2>/dev/null || nginx -s stop 2>/dev/null || true
       sleep 1
       # 再次确认 443 已释放
-      if ss -tlnp 2>/dev/null | grep -q ':443 '; then
-        die "nginx 停止后 443 仍被占用（可能有其他进程），请手动执行: ss -tlnp | grep :443"
+      if ss -tlnp 2>/dev/null | grep -q ":443 "; then
+        die "nginx 停止后 443 仍被占用（可能有其他进程），请手动执行: ss -tlnp | awk '\$4 ~ /:443\$/ {print}'"
       fi
       info "443 端口已释放，继续安装..."
     else
@@ -1786,10 +1930,17 @@ fresh_install(){
   check_deps
   optimize_kernel_network
   install_nginx
-    init_nginx_stream
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
+  init_nginx_stream
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   setup_firewall_transit
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   write_logrotate
-
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   mkdir -p "$MANAGER_BASE"
   # [Doc3-1] 事务回滚 trap：nginx/firewall 已写入但路由导入失败时，撤销所有副作用
   # 触发条件：add_landing_route 失败 / 用户 Ctrl-C / 任何 ERR
@@ -1816,7 +1967,11 @@ fresh_install(){
 
   # nginx 启动必须在路由导入前完成（路由导入会触发 nginx reload）
   # [F2] hard-fail on enable — reboot persistence is a contract requirement
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   systemctl enable nginx || die "nginx enable failed — decoy will not survive reboot"
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   systemctl is-enabled --quiet nginx || die "nginx is-enabled check failed"
   # [v2.7 Architect-🟠] Remove raw `nginx` fallback: an unmanaged daemon breaks idempotent
   # stop/reload/rollback and leaves the host in a "works now, unmanaged later" state.
@@ -1830,11 +1985,15 @@ fresh_install(){
 
   echo ""
   echo -e "${BOLD}── 录入第一台落地机配令人信息 ─────────────────────────────────────${NC}"
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   add_landing_route
 
   # 路由导入成功，提交安装标记并解除回滚 trap
   __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=0
   trap '_global_cleanup; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM
+  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
+  trap '_fresh_install_rollback' ERR INT TERM
   touch "$INSTALLED_FLAG"
 
   echo ""
@@ -1880,8 +2039,8 @@ main(){
   _check_update >"$UPDATE_WARN_FILE" 2>&1 &
   UPDATE_CHECK_PID=$!
   _prune_orphan_stream_maps
+  local _durable_transit=0
   if [[ ! -f "$INSTALLED_FLAG" ]]; then
-    local _durable_transit=0
     if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null &&        find "$CONF_DIR" -maxdepth 1 -type f -name "*.meta" 2>/dev/null | grep -q .; then
       if _meta_drift_detect; then
         warn "[reconcile] durable set has meta/map drift — leaving .installed absent"
@@ -1898,7 +2057,6 @@ main(){
     # [v2.8 Architect-🟠] Startup stale-marker reconciliation: verify the durable set
     # (nginx stream include + at least one .meta file). A SIGKILL during import_token's
     # first-time path can write INSTALLED_FLAG while nginx artifacts are incomplete.
-    local _durable_transit=1
     grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null       || _durable_transit=0
     find "$CONF_DIR" -name "*.meta" -type f -maxdepth 1 2>/dev/null \
          | grep -q . 2>/dev/null                                           || _durable_transit=0
@@ -1934,10 +2092,14 @@ main(){
       warn "stream include 丢失，自动修复中..."
       # v2.42 GPT #2: reload 成功才算修复，不能只靠 nginx -t
       if init_nginx_stream 2>/dev/null; then
-        if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
-          nginx -t 2>/dev/null && success "stream include 已修复（reload 已生效）"             || { warn "stream include 修复后 nginx -t 失败"; _reconcile_ok=0; }
+        if nginx -t 2>/dev/null; then
+          if systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null; then
+            success "stream include 已修复（reload 已生效）"
+          else
+            warn "stream include 修复后 nginx reload 失败（运行态未生效）"; _reconcile_ok=0
+          fi
         else
-          warn "stream include 修复后 nginx reload 失败（运行态未生效）"; _reconcile_ok=0
+          warn "stream include 修复后 nginx -t 失败"; _reconcile_ok=0
         fi
       else
         warn "stream include 修复失败"; _reconcile_ok=0
