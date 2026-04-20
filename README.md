@@ -30,13 +30,13 @@ Client (TLS SNI)
 ### 中转机（一台）
 
 ```bash
-curl -sL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/blob/main/install_transit.sh | sudo bash
+curl -sL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/refs/heads/main/install_transit.sh | sudo bash
 ```
 
 ### 落地机（多台）
 
 ```bash
-curl -sL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/blob/main/install_landing.sh | sudo bash -s -- --cloudflare <CF_TOKEN>
+curl -sL https://raw.githubusercontent.com/vpn3288/Chained-Proxy/refs/heads/main/install_landing.sh | sudo bash -s -- --cloudflare <CF_TOKEN>
 ```
 
 ## 中转机管理
