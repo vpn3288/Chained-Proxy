@@ -127,7 +127,6 @@ atomic_write()(
   safe_mkdir "$dir"
   tmp="$(mktemp "$dir/.transit-mgr.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
-  [[ -n "$tmp" ]] || { echo "atomic_write: mktemp returned empty path" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
     || { echo "atomic_write: cat to $tmp failed" >&2; exit 1; }
@@ -704,19 +703,12 @@ init_nginx_stream(){
   (( _stream_zone_mb < 5  )) && _stream_zone_mb=5
   (( _stream_zone_mb > 64 )) && _stream_zone_mb=64
 
-  # [ENHANCED v3.63] 🎭 隐蔽性增强：Apple CDN IP 轮换池
-  # 使用多个 Apple CDN IP 轮换，降低单个 IP 被识别的风险
-  # IP 池来源：Apple CDN 的多个边缘节点（通过 dig swcdn.apple.com 获取）
-  local APPLE_CDN_IPS=("17.253.144.10" "17.253.144.11" "17.253.144.12" "17.253.144.13")
-  local SELECTED_APPLE_IP="${APPLE_CDN_IPS[$((RANDOM % ${#APPLE_CDN_IPS[@]}))]}"
-  info "已选择 Apple CDN IP: ${SELECTED_APPLE_IP}（从 ${#APPLE_CDN_IPS[@]} 个 IP 中随机选择）"
-  
   # v2.32 Grok: v1.4: 纯本地 decoy（127.0.0.1:45231），无 DNS 查询，无时序特征
-# 空/无匹配SNI → 直接回落到 Apple CDN（IP 轮换池）
+# 空/无匹配SNI → 直接回落到 Apple CDN 17.253.144.10:443
   # resolver 故障 → 降级至本地 45231（速率限制保护）
   atomic_write "$NGINX_STREAM_CONF" 644 root:root <<NGINX_STREAM_EOF
 # stream-transit.conf — 由 install_transit_${VERSION}.sh 管理，请勿手动修改
-# v3.63 STEALTH: Apple CDN IP 轮换池，降低单个 IP 被识别的风险
+# v2.48: 全量 fallback 直接至 Apple CDN IP，彻底消除二次映射和 DNS 查询
 # 有效落地机SNI→落地机IP:PORT；无效/空/畸形SNI→Apple CDN（透明盲传）
 stream {
     access_log off;
@@ -729,15 +721,15 @@ stream {
     # [v2.11] Dynamic zone size: ~3% of host RAM, floor 5m, cap 64m
     limit_conn_zone \$binary_remote_addr zone=transit_stream_conn:${_stream_zone_mb}m;
 
-    # v3.63 STEALTH: SNI 守卫内嵌到 map——超长(≥254字节)/含控制字符/空/无匹配 → Apple CDN IP 轮换池
+    # v2.48: SNI 守卫内嵌到 map——超长(≥254字节)/含控制字符/空/无匹配 → 本地 decoy
     map \$ssl_preread_server_name \$backend_upstream {
         hostnames;
         include /etc/nginx/stream-snippets/landing_*.map;
         # Fallback regexes intentionally stay after the per-node includes so only unmatched or malformed SNI values reach Apple CDN.
-        "~^.{254,}"      ${SELECTED_APPLE_IP}:443;
-        "~[\x00-\x1F]" ${SELECTED_APPLE_IP}:443;
-        ""               ${SELECTED_APPLE_IP}:443;
-        default          ${SELECTED_APPLE_IP}:443;
+        "~^.{254,}"      17.253.144.10:443;
+        "~[\x00-\x1F]" 17.253.144.10:443;
+        ""               17.253.144.10:443;
+        default          17.253.144.10:443;
     }
 
     server {
@@ -753,12 +745,12 @@ ${ipv6_listen}
         proxy_connect_timeout  5s;
         # v1.3: 315s = 5min15s，覆盖 gRPC 长流协议；2h 会导致 Nginx worker 无法回收
         # gRPC keepalive 心跳间隔通常 60-120s，315s 足够防误断
-        proxy_timeout          120s;  # [ENHANCED] Reduced to mimic normal CDN
+        proxy_timeout          315s;
         proxy_socket_keepalive on;
         tcp_nodelay            on;
         # [F2] 100 per IP: gRPC multiplexes all streams over few TCP connections;
         # 2000 per IP + 315s timeout = slow-drain DoS from just 50 distributed IPs.
-        limit_conn transit_stream_conn 200;  # [ENHANCED] Support multi-device users
+        limit_conn transit_stream_conn 100;
     }
 }
 NGINX_STREAM_EOF
@@ -885,21 +877,27 @@ setup_firewall_transit(){
   # that names FW_CHAIN or FW_TMP before attempting -F / -X / -E.
   # [MASTER_ARCHITECT_FIX_3] Use machine-readable iptables -S format instead of human-readable -L
 _bulldoze_input_refs_t(){
-    local _chain="$1" _lines _line
-    mapfile -t _lines < <(iptables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)" | sed 's/^-A INPUT //' || true)
-    for _line in "${_lines[@]}"; do
-      [[ -n "$_line" ]] || continue
-      iptables -w 2 -D INPUT $_line 2>/dev/null || true
-    done
+    local _chain="$1" _rule _line_num
+    # Use iptables -S INPUT to get machine-readable format, grep for chain references
+    while IFS= read -r _rule; do
+      [[ -n "$_rule" ]] || continue
+      # Extract line number by counting matching rules from the beginning
+      _line_num=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | grep -F "$_chain" | head -1 | awk '{print $1}')
+      [[ -n "$_line_num" ]] || break
+      iptables -w 2 -D INPUT "$_line_num" 2>/dev/null || true
+    done < <(iptables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)")
   }
 
 _bulldoze_input_refs6_t(){
-    local _chain="$1" _lines _line
-    mapfile -t _lines < <(ip6tables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)" | sed 's/^-A INPUT //' || true)
-    for _line in "${_lines[@]}"; do
-      [[ -n "$_line" ]] || continue
-      ip6tables -w 2 -D INPUT $_line 2>/dev/null || true
-    done
+    local _chain="$1" _rule _line_num
+    # Use ip6tables -S INPUT to get machine-readable format, grep for chain references
+    while IFS= read -r _rule; do
+      [[ -n "$_rule" ]] || continue
+      # Extract line number by counting matching rules from the beginning
+      _line_num=$(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | grep -F "$_chain" | head -1 | awk '{print $1}')
+      [[ -n "$_line_num" ]] || break
+      ip6tables -w 2 -D INPUT "$_line_num" 2>/dev/null || true
+    done < <(ip6tables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)")
   }
 
   _bulldoze_input_refs_t "$FW_CHAIN";  _bulldoze_input_refs_t "$FW_TMP"
@@ -926,11 +924,11 @@ _bulldoze_input_refs6_t(){
   # v1.3: 明确 ACCEPT 新建 443 连接（connlimit/rate 只拦 DDoS，正常流量必须先过这一关）
   # 规则顺序：① connlimit（超并发 DROP）→ ② rate（超速率 DROP）→ ③ ACCEPT 剩余正常 443 新连接
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 32        -m comment --comment "transit-manager-rule" -j DROP
+    -m connlimit --connlimit-above 2000 --connlimit-mask 32        -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0        -m comment --comment "transit-manager-rule" -j DROP
+    -m connlimit --connlimit-above 20000 --connlimit-mask 0        -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit                   -m comment --comment "transit-manager-rule" -j ACCEPT
+    -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit                   -m comment --comment "transit-manager-rule" -j ACCEPT
   # 超速率的 443 DROP（rate 令牌耗尽时走此规则）
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT"              -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP"                                              -m comment --comment "transit-manager-rule" -j DROP
@@ -948,11 +946,11 @@ _bulldoze_input_refs6_t(){
   # (the swap inserted it there; rename doesn't change position).
   # Line 935 inserted a second jump to the same chain, creating a duplicate.
   # Position check below verifies FW_CHAIN is at position 1.
-  # [H2 Fix] Verify INPUT position 1 — die if not at position 1 (SSH lockout risk)
+  # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
   local _actual_pos
   _actual_pos=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1; exit}')
   if [[ "${_actual_pos:-}" != "1" ]]; then
-    die "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），存在 SSH 锁死风险，拒绝继续"
+    warn "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），可能与其他服务冲突"
   fi
   local _n
   mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP" '$2==c {print $1}' | sort -rn)
@@ -974,11 +972,11 @@ _bulldoze_input_refs6_t(){
       ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
       # v2.43 Grok: IPv6 加 connlimit+rate，与 IPv4 对等防护（/64 对应 IPv6 CGNAT 粒度）
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 64  -j DROP
+        -m connlimit --connlimit-above 2000 --connlimit-mask 64  -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -j DROP
+        -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
+        -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT"      -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -j DROP
       ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-swap" -j "$FW_TMP6"
@@ -1057,9 +1055,9 @@ iptables -w 2 -A __FW_CHAIN__-NEW -m conntrack --ctstate INVALID,UNTRACKED    -m
 iptables -w 2 -A __FW_CHAIN__-NEW -m conntrack --ctstate ESTABLISHED,RELATED  -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request            -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 32 -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit             -m comment --comment "transit-manager-rule" -j ACCEPT
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 32 -m comment --comment "transit-manager-rule" -j DROP
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -m comment --comment "transit-manager-rule" -j DROP
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit             -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__                                                         -m comment --comment "transit-manager-rule" -j DROP
 iptables -w 2 -A __FW_CHAIN__-NEW                                              -m comment --comment "transit-manager-rule" -j DROP
 _bulldoze_input_refs(){
@@ -1101,9 +1099,9 @@ if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6table
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 64 -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6 -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 64 -j DROP
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6 -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -j DROP
   local _n

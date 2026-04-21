@@ -1,0 +1,11 @@
+--- install_landing_fixed.sh.orig
++++ install_landing_fixed.sh
+@@ -1263,7 +1263,8 @@
+ tls_settings = {
+     "minVersion": "1.2",
+-    # [Doc5-Grok] ALPN already includes http/1.0 since v1.4 to reduce ALPN distinctiveness
+     "alpn": ["h2", "http/1.1", "http/1.0"],
++    # [FIX-UTLS] Add Chrome fingerprint to mimic real browser TLS handshake
++    "fingerprint": "chrome",
+     # [Fix-2 / Role-C-🔴] rejectUnknownSni=True: GFW sends wrong/no SNI → Xray aborts handshake.
+     # Rationale: with False, Xray serves the *real* cert (containing your domain) to any prober

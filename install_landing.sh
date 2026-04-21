@@ -223,7 +223,6 @@ atomic_write()(
   mkdir -p "$dir"
 tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
-  [[ -n "$tmp" ]] || { echo "atomic_write: mktemp returned empty path" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
     || { echo "atomic_write: cat to $tmp failed" >&2; exit 1; }
@@ -236,54 +235,6 @@ tmp="$(mktemp "$dir/.xray-landing.XXXXXX" 2>/dev/null)" \
   mv -f "$tmp" "$target" \
     || { echo "atomic_write: mv $tmp -> $target failed" >&2; exit 1; }
 )
-
-# [ENHANCED v3.63] 🔐 安全性增强：Cloudflare Token 加密存储
-# 使用 OpenSSL AES-256-CBC 加密，密钥基于机器唯一标识符
-encrypt_cf_token(){
-  local plaintext="$1"
-  [[ -z "$plaintext" ]] && { echo ""; return 0; }
-  
-  # 使用 machine-id 作为密钥基础（每台机器唯一）
-  local machine_key
-  if [[ -f /etc/machine-id ]]; then
-    machine_key=$(cat /etc/machine-id)
-  elif [[ -f /var/lib/dbus/machine-id ]]; then
-    machine_key=$(cat /var/lib/dbus/machine-id)
-  else
-    # Fallback: 使用主机名+内核版本作为密钥
-    machine_key="$(hostname)-$(uname -r)"
-  fi
-  
-  # 使用 OpenSSL 加密（base64 编码输出）
-  echo -n "$plaintext" | openssl enc -aes-256-cbc -a -salt -pass pass:"$machine_key" 2>/dev/null \
-    || { warn "CF_TOKEN 加密失败，将使用明文存储"; echo "$plaintext"; }
-}
-
-decrypt_cf_token(){
-  local ciphertext="$1"
-  [[ -z "$ciphertext" ]] && { echo ""; return 0; }
-  
-  # 检测是否为加密格式（base64 + Salted__ 前缀）
-  if ! echo "$ciphertext" | base64 -d 2>/dev/null | grep -q "^Salted__"; then
-    # 不是加密格式，直接返回（兼容旧版明文存储）
-    echo "$ciphertext"
-    return 0
-  fi
-  
-  # 使用 machine-id 作为密钥基础
-  local machine_key
-  if [[ -f /etc/machine-id ]]; then
-    machine_key=$(cat /etc/machine-id)
-  elif [[ -f /var/lib/dbus/machine-id ]]; then
-    machine_key=$(cat /var/lib/dbus/machine-id)
-  else
-    machine_key="$(hostname)-$(uname -r)"
-  fi
-  
-  # 使用 OpenSSL 解密
-  echo -n "$ciphertext" | openssl enc -aes-256-cbc -d -a -pass pass:"$machine_key" 2>/dev/null \
-    || { warn "CF_TOKEN 解密失败，可能密钥不匹配"; echo "$ciphertext"; }
-}
 
 # v2.32: 全局写操作互斥锁，防止两个终端并发修改同一状态
 # [v2.13 GPT-🔴] Lock file moved from /tmp to script-owned ${MANAGER_BASE}/tmp.
@@ -331,8 +282,7 @@ load_manager_config(){
   [[ "$tg" =~ ^[0-9]+$ ]] && TROJAN_GRPC_PORT="$tg" || TROJAN_GRPC_PORT=0
   [[ "$vw" =~ ^[0-9]+$ ]] && VLESS_WS_PORT="$vw" || VLESS_WS_PORT=0
   [[ "$tt" =~ ^[0-9]+$ ]] && TROJAN_TCP_PORT="$tt" || TROJAN_TCP_PORT=0
-  # [ENHANCED v3.63] 解密 CF_TOKEN（兼容旧版明文存储）
-  [[ -n "$ct" ]] && CF_TOKEN="$(decrypt_cf_token "$ct")" || CF_TOKEN=""
+  [[ -n "$ct" ]] && CF_TOKEN="$ct" || CF_TOKEN=""
   [[ -n "$cu" ]] && CREATED_USER="$cu" || CREATED_USER="0"
   [[ -n "$ah" ]] && ACME_HOME="$ah" || ACME_HOME="${LANDING_BASE}/acme"
   [[ -n "$bc" ]] && BIND_IP="$bc" || BIND_IP="0.0.0.0"
@@ -341,9 +291,6 @@ load_manager_config(){
 
 save_manager_config(){
   mkdir -p "$MANAGER_BASE"
-  # [ENHANCED v3.63] 加密 CF_TOKEN 后再存储
-  local ENCRYPTED_CF_TOKEN
-  ENCRYPTED_CF_TOKEN=$(encrypt_cf_token "${CF_TOKEN}")
   atomic_write "$MANAGER_CONFIG" 600 root:root <<MCEOF
 LANDING_PORT=${LANDING_PORT}
 VLESS_UUID=${VLESS_UUID}
@@ -351,7 +298,7 @@ VLESS_GRPC_PORT=${VLESS_GRPC_PORT}
 TROJAN_GRPC_PORT=${TROJAN_GRPC_PORT}
 VLESS_WS_PORT=${VLESS_WS_PORT}
 TROJAN_TCP_PORT=${TROJAN_TCP_PORT}
-CF_TOKEN=${ENCRYPTED_CF_TOKEN}
+CF_TOKEN=${CF_TOKEN}
 CREATED_USER=${CREATED_USER}
 MARKER_VERSION=${VERSION}
 ACME_HOME=${ACME_HOME}
@@ -448,28 +395,14 @@ validate_domain(){
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *".."* ]] && die "域名不能包含连续的点: $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
-  # [CRITICAL FIX] Separate Python execution check from validation logic
-  if ! command -v python3 >/dev/null 2>&1; then
-    die "Python3 未安装，无法验证域名格式"
-  fi
-  local py_result
-  if ! py_result=$(printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" 2>&1); then
-    if [[ -n "$py_result" ]]; then
-      die "Python 域名验证崩溃: $py_result"
-    else
-      die "域名格式非法: $d"
-    fi
-  fi
+  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || die "域名格式非法: $d"
 }
 
 validate_ipv4(){
   local ip="$1"
-  # [CRITICAL FIX] Separate Python execution check from validation logic
-  if ! command -v python3 >/dev/null 2>&1; then
-    die "Python3 未安装，无法验证 IPv4 格式"
-  fi
-  local py_result
-  if ! py_result=$(printf '%s' "$ip" | python3 -c "import ipaddress, sys
+  # [R1 Fix] Import Path to avoid NameError in embedded Python
+  printf '%s' "$ip" | python3 -c "from pathlib import Path
+import ipaddress, sys
 ip = sys.stdin.read().strip()
 try:
     addr = ipaddress.IPv4Address(ip)
@@ -477,13 +410,7 @@ try:
         raise SystemExit(1)
 except ValueError:
     raise SystemExit(1)
-" 2>&1); then
-    if [[ -n "$py_result" ]]; then
-      die "Python IPv4 验证崩溃: $py_result"
-    else
-      die "IPv4 格式非法: $ip"
-    fi
-  fi
+" >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
 }
 
 validate_port(){
@@ -808,18 +735,13 @@ setup_fallback_decoy(){
   local _check_port _pid_list _proc _bad=0
   for _check_port in 45231 45232; do
     [[ "$_check_port" =~ ^[0-9]+$ ]] || die "Invalid port number"
-    # [HIGH FIX] Remove || true to let port check errors propagate
-    if command -v fuser >/dev/null 2>&1; then
-      _pid_list=$(fuser -n tcp "$_check_port" 2>/dev/null)
-    else
-      _pid_list=""
-    fi
+  _pid_list=$(command -v fuser >/dev/null 2>&1 && fuser -n tcp "$_check_port" 2>/dev/null || true)
     [[ -n "${_pid_list:-}" ]] || continue
     while IFS= read -r _proc; do
       [[ -z "$_proc" ]] && continue
       [[ "$_proc" == nginx ]] || _bad=1
     done < <(echo "$_pid_list" | tr ' ' '\n' | grep -E '^[0-9]+$' \
-    | xargs -r ps -o comm= -p 2>/dev/null | sed '/^$/d')
+    | xargs -r ps -o comm= -p 2>/dev/null | sed '/^$/d' || true)
     (( _bad )) && die "端口 45231 或 45232 已被非 Nginx 进程占用，请检查是否有其他服务在使用该端口"
   done
   if ! command -v nginx &>/dev/null; then
@@ -829,43 +751,26 @@ setup_fallback_decoy(){
   fi
   _tune_nginx_worker_connections
   local need_ipv6=0; have_ipv6 && need_ipv6=1
-  # [ENHANCED v3.63] 🎭 隐蔽性增强：Nginx Fallback 模拟真实网站行为
-  # 返回 403/robots.txt/favicon.ico 而不是 444，避免被识别为代理特征
   if (( need_ipv6 )); then
     atomic_write "$fallback_conf" 644 root:root <<'FDEOF'
 # xray-landing-fallback.conf — 防探针回落站，由脚本管理，请勿手动修改
-# [v3.63 STEALTH] 模拟真实网站行为：返回 403/robots.txt/favicon.ico
-# 避免 return 444 的代理特征，提升隐蔽性
+# [v2.13] listen http2: Xray passes plaintext H2 frames after TLS termination;
+#   nginx must speak h2c to avoid a distinct preface-mismatch fingerprint.
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
-    listen [::1]:45231 http2;
-    listen [::1]:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
+    listen [::1]:45231;
+    listen [::1]:45232;
     server_name _;
     server_tokens off;
-    
+    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
-    
-    # 模拟真实网站：返回 403 而不是 444
-    location / {
-        return 403 "Access Denied";
-        add_header Content-Type text/plain;
-    }
-    
-    # 模拟 robots.txt（常见爬虫探测目标）
-    location = /robots.txt {
-        return 200 "User-agent: *\nDisallow: /\n";
-        add_header Content-Type text/plain;
-    }
-    
-    # 模拟 favicon.ico（浏览器自动请求）
-    location = /favicon.ico {
-        return 204;
-    }
-    
+    error_page 400 503 = @silent_close;
+    location @silent_close { return 444; }
+    location / { return 444; }
     access_log off;
     error_log /dev/null;
 }
@@ -873,36 +778,21 @@ FDEOF
   else
     atomic_write "$fallback_conf" 644 root:root <<'FDEOF'
 # xray-landing-fallback.conf — 防探针回落站，由脚本管理，请勿手动修改
-# [v3.63 STEALTH] 模拟真实网站行为：返回 403/robots.txt/favicon.ico
-# 避免 return 444 的代理特征，提升隐蔽性
+# [v2.13] listen http2: Xray passes plaintext H2 frames after TLS termination;
+#   nginx must speak h2c to avoid a distinct preface-mismatch fingerprint.
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
     server_name _;
     server_tokens off;
-    
+    http2 on;
     limit_conn fallback_conn 4;
     limit_req  zone=fallback_req burst=50 nodelay;
-    
-    # 模拟真实网站：返回 403 而不是 444
-    location / {
-        return 403 "Access Denied";
-        add_header Content-Type text/plain;
-    }
-    
-    # 模拟 robots.txt（常见爬虫探测目标）
-    location = /robots.txt {
-        return 200 "User-agent: *\nDisallow: /\n";
-        add_header Content-Type text/plain;
-    }
-    
-    # 模拟 favicon.ico（浏览器自动请求）
-    location = /favicon.ico {
-        return 204;
-    }
-    
+    error_page 400 503 = @silent_close;
+    location @silent_close { return 444; }
+    location / { return 444; }
     access_log off;
     error_log /dev/null;
 }
@@ -918,7 +808,7 @@ FDEOF
     systemctl is-enabled --quiet nginx       || die "nginx is-enabled check failed"
     systemctl start nginx || die "Nginx 启动失败"
   fi
-  success "fallback 防探针站已就绪（已启用真实网站模拟）"
+  success "fallback 防探针站已就绪"
 }
 
 _write_cert_reload_script(){
@@ -929,24 +819,17 @@ _write_cert_reload_script(){
 # xray-landing-reload-v\${VERSION}
 set -eu
 CERT_DIR="\${1:-}"
-# [C1 Fix] Validate CERT_DIR is non-empty; exit 0 if directory doesn't exist (first-install path)
-if [ -z "\$CERT_DIR" ]; then
-  logger -t acme-xray-landing "ERROR: CERT_DIR is empty"
+# [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
+if [ -z "\$CERT_DIR" ] || [ ! -d "\$CERT_DIR" ]; then
+  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '\$CERT_DIR'"
   exit 1
 fi
-if [ ! -d "\$CERT_DIR" ]; then
-  logger -t acme-xray-landing "INFO: CERT_DIR does not exist yet (first-install path) — skipping reload"
-  exit 0
-fi
 
-# [HIGH FIX] Check if service unit file exists before trying to reload
-# This prevents race condition where reloadcmd runs during --install-cert
-# before create_systemd_service has created the unit file
-if [ ! -f "/etc/systemd/system/xray-landing.service" ]; then
-  logger -t acme-xray-landing "INFO: xray-landing.service unit file not yet created — skipping reload (first-install path)"
-  exit 0
-fi
-
+# [v2.15 Bug Fix] acme.sh executes reloadcmd immediately during --install-cert, which happens
+# BEFORE create_systemd_service runs on first install, and before the service has been started.
+# Check is-active: if service is not yet running (first-install path), exit 0 silently so
+# acme.sh reports success and installation continues normally.
+# On subsequent renewals the service will be running and reload proceeds normally.
 if ! /bin/systemctl is-active --quiet xray-landing.service 2>/dev/null; then
   logger -t acme-xray-landing "INFO: xray-landing.service not yet active — skipping reload (first-install or transient path)"
   exit 0
@@ -965,13 +848,15 @@ chmod 640 "\$CERT_DIR/key.pem" \
   || { logger -t acme-xray-landing "ERROR: chmod 640 failed for key.pem — key may be exposed"; exit 1; }
 
 if openssl x509 -checkend 86400 -noout -in "\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
-  # [H1 Fix] 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效）
-  # 直接 restart，移除无效的 reload 尝试
-  if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
-    _msg="FATAL: restart failed for xray-landing.service"
-    logger -t acme-xray-landing "\$_msg"
-    echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true
-    exit 1
+  # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
+  # [v2.10 Architect-🟠] Restart is the correct behavior for Xray cert reload. The reload attempt first
+  # is for future-proofing if Xray ever supports in-place reload, but restart is the actual fallback.
+  if ! /bin/systemctl reload xray-landing.service 2>/dev/null; then
+    # [v2.32 Fix] reload失败时尝试一次restart，再失败才退出
+    logger -t acme-xray-landing "WARN: reload failed — attempting restart"
+    if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
+        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "\$_msg"; echo "\$(date '+%Y-%m-%d %H:%M:%S') \$_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
+    fi
   fi
 else
   # 证书校验失败：只记录告警，保留旧内存态等下次 cron 重试，绝不主动干预进程
@@ -1012,7 +897,7 @@ issue_certificate(){
       chown -R root:"$LANDING_USER" "$cert_dir" 2>/dev/null || true
       chmod 750 "$cert_dir" 2>/dev/null || true
       chmod 644 "${cert_dir}/cert.pem" "${cert_dir}/fullchain.pem" 2>/dev/null || true
-      chmod 600 "${cert_dir}/key.pem"  # [ENHANCED] Root-only access 2>/dev/null || true
+      chmod 640 "${cert_dir}/key.pem" 2>/dev/null || true
       # v2.35 GPT: 早返回分支也检查续期基础设施，防"证书健康但续期链路断开"静默断流
       if [[ ! -f "$CERT_RELOAD_SCRIPT" ]] || ! grep -q "# xray-landing-reload-v${VERSION}" "$CERT_RELOAD_SCRIPT" 2>/dev/null; then
         warn "证书重载脚本缺失或版本过旧，重新生成..."
@@ -1071,8 +956,8 @@ issue_certificate(){
 
 _wait_dns_txt(){
     local _d="$1" _max=120 _step=20 _elapsed=0
-    # [HIGH FIX] Simplified trap handler - removed sleep 2 to avoid blocking in trap
-    trap 'echo ""; warn "DNS 等待被中断（请等待传播完成后再试）"; trap - INT TERM; return 1' INT TERM
+    # [R11 Fix] Trap INT/TERM during DNS wait to prevent premature ACME attempt
+    trap 'echo ""; warn "DNS 等待被中断（请等待传播完成后再试）"; sleep 2; trap - INT TERM; return 1' INT TERM
     info "等待 DNS TXT 传播（主动探测 _acme-challenge.${_d}，最长 ${_max}s）..."
     while (( _elapsed < _max )); do
       if dig +short +time=3 +tries=1 TXT "_acme-challenge.${_d}" 2>/dev/null | sed '/^$/d' | grep -q .; then
@@ -1140,7 +1025,7 @@ for try in 1 2; do
   # 证书目录额外加固：私钥仅 group 可读，不对 other 开放
   chmod 750 "$cert_dir"
   chmod 644 "${cert_dir}/cert.pem" "${cert_dir}/fullchain.pem"
-  chmod 600 "${cert_dir}/key.pem"  # [ENHANCED] Root-only access
+  chmod 640 "${cert_dir}/key.pem"
   # config.json 也需要对 xray-landing 可读
   [[ -f "$LANDING_CONF" ]] && chmod 640 "$LANDING_CONF" 2>/dev/null || true
   success "证书部署完成（LANDING_BASE 权限已归 ${LANDING_USER}，key.pem=640）"
@@ -1190,11 +1075,9 @@ _any_expiring=0
 for c in /etc/xray-landing/certs/*/fullchain.pem; do
   [ -f "$c" ] || continue
   dom=$(echo "$c" | sed 's|/etc/xray-landing/certs/\(.*\)/fullchain.pem|\1|')
-  if ! openssl x509 -checkend 2592000 -noout -in "$c" 2>/dev/null; then
-    msg="FATAL: 证书 ${dom} 将在30天内过期，续期链路可能失效！请检查 acme cron 并手动续期"
+  if ! openssl x509 -checkend 604800 -noout -in "$c" 2>/dev/null; then
+    msg="FATAL: 证书 ${dom} 将在7天内过期，续期链路可能失效！请检查 acme cron 并手动续期"
     logger -t xray-cert-monitor "$msg"
-    # [ENHANCED] Auto-retry renewal
-    env ACME_HOME="/etc/xray-landing/acme" "/etc/xray-landing/acme/acme.sh" --renew --domain "$dom" --ecc --force >> /var/log/acme-xray-landing-renew.log 2>&1 || true
     echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> /var/log/acme-xray-landing-renew.log || true
     _any_expiring=1
     # [v2.7] Auto-clear circuit-breaker so reloadcmd on next acme.sh run can succeed
@@ -1206,7 +1089,7 @@ done
 if [ "$_any_expiring" = "1" ]; then
   cat > /etc/profile.d/xray-cert-alert.sh << 'ALERT_EOF'
 echo -e '\033[0;31m================================================================\033[0m'
-echo -e '\033[0;31m[FATAL] xray-landing: 证书将在30天内过期，续期链路可能已断！\033[0m'
+echo -e '\033[0;31m[FATAL] xray-landing: 证书将在7天内过期，续期链路可能已断！\033[0m'
 echo -e '\033[0;31m  请检查: cat /var/log/acme-xray-landing-renew.log\033[0m'
 echo -e '\033[0;31m  并手动续期后删除此告警: rm /etc/profile.d/xray-cert-alert.sh\033[0m'
 echo -e '\033[0;31m================================================================\033[0m'
@@ -1296,14 +1179,14 @@ for path in sorted(glob.glob(os.path.join(nodes_dir, '*.conf'))):
         raise ValueError(f"Zero-byte node file detected: {path}")
     # [R13 Fix] Also check for non-zero files that contain only whitespace or comments
     try:
-        file_content = Path(path).read_text(encoding='utf-8', errors='strict').strip()
+        file_content = Path(path).read_text(encoding='utf-8', errors='replace').strip()
         if not file_content or file_content.startswith('#'):
             raise ValueError(f"Node file contains no valid data: {path}")
     except OSError as e:
         raise ValueError(f"Cannot read node file {path}: {e}")
     dom = pwd = ''
     try:
-        for line in open(path, encoding='utf-8', errors='strict'):
+        for line in open(path, encoding='utf-8', errors='replace'):
             line = line.strip()
             if line.startswith('DOMAIN='):   dom = line[7:]
             if line.startswith('PASSWORD='): pwd = line[9:]
@@ -1346,7 +1229,6 @@ tls_settings = {
     "minVersion": "1.2",
     # [Doc5-Grok] ALPN already includes http/1.0 since v1.4 to reduce ALPN distinctiveness
     "alpn": ["h2", "http/1.1", "http/1.0"],
-    "fingerprint": "chrome",  # [ENHANCED] Mimic Chrome browser TLS handshake
     # [Fix-2 / Role-C-🔴] rejectUnknownSni=True: GFW sends wrong/no SNI → Xray aborts handshake.
     # Rationale: with False, Xray serves the *real* cert (containing your domain) to any prober
     # → direct domain exposure. A TLS abort is a smaller signal than revealing the cert domain.
@@ -3096,22 +2978,7 @@ fresh_install(){
   fi
   [[ "$CONFIRM" =~ ^[Yy]$ ]] || { info "已取消"; exit 0; }
 
-  # [ENHANCED v3.63] 🔍 端口冲突检测增强：集中检测所有端口
-  # 检测外网端口（LANDING_PORT）
   ss -tlnp 2>/dev/null | grep -q ":${LANDING_PORT} " && die "端口 ${LANDING_PORT} 已被占用（请先检查 nginx / xray* / mack-a*）"
-  # 检测 Nginx fallback 端口（45231, 45232）
-  local _fallback_ports=(45231 45232)
-  for _fbp in "${_fallback_ports[@]}"; do
-    if ss -tlnp 2>/dev/null | grep -q ":${_fbp} "; then
-      local _occupier; _occupier=$(ss -tlnp 2>/dev/null | awk -v p=":${_fbp} " '$4 ~ p {print $6}' | head -1)
-      # 允许 Nginx 占用（可能是之前的安装）
-      if [[ "$_occupier" =~ nginx ]]; then
-        warn "端口 ${_fbp} 已被 Nginx 占用，将复用现有配置"
-      else
-        die "端口 ${_fbp} 已被非 Nginx 进程占用：${_occupier}，请检查是否有其他服务在使用该端口"
-      fi
-    fi
-  done
   # [HermesAgent] mack-a detection for landing node
   if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
     # [R23 Fix] Explicitly tell user to stop mack-a services when port conflict detected
@@ -3190,16 +3057,9 @@ fresh_install(){
     rm -f "/etc/nginx/conf.d/xray-landing-fallback.conf" 2>/dev/null || true
     rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
-    # [ENHANCED v3.63] 🔧 完善回滚机制：清理 IPv4 和 IPv6 防火墙规则
     while iptables -w 2 -D INPUT -j "$FW_CHAIN" 2>/dev/null; do :; done
     iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true
     iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-    # IPv6 防火墙规则清理
-    if command -v ip6tables >/dev/null 2>&1; then
-      while ip6tables -w 2 -D INPUT -j "$FW_CHAIN6" 2>/dev/null; do :; done
-      ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true
-      ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
-    fi
     # [F3] Clean installed binary and assets — install_xray_binary() runs before this trap
     # fires; leaving the binary creates a contaminated host state on the next run.
     rm -f "$LANDING_BIN" "$CERT_RELOAD_SCRIPT" "$LOGROTATE_FILE" 2>/dev/null || true
@@ -3229,9 +3089,6 @@ fresh_install(){
   # sync_xray_config + create_systemd_service + setup_firewall all succeed.
   local _staged_fi_mgr; _staged_fi_mgr=$(mktemp "${MANAGER_BASE}/tmp/.manager.XXXXXX") \
     || die "mktemp _staged_fi_mgr failed — MANAGER_BASE/tmp missing or disk full"
-  # [ENHANCED v3.63] 加密 CF_TOKEN 后再存储到临时 manager.conf
-  local _ENCRYPTED_CF_TOKEN
-  _ENCRYPTED_CF_TOKEN=$(encrypt_cf_token "${CF_TOKEN}")
   atomic_write "$_staged_fi_mgr" 600 root:root <<SMFI
 LANDING_PORT=${LANDING_PORT}
 VLESS_UUID=${VLESS_UUID}
@@ -3239,7 +3096,7 @@ VLESS_GRPC_PORT=${VLESS_GRPC_PORT}
 TROJAN_GRPC_PORT=${TROJAN_GRPC_PORT}
 VLESS_WS_PORT=${VLESS_WS_PORT}
 TROJAN_TCP_PORT=${TROJAN_TCP_PORT}
-CF_TOKEN=${_ENCRYPTED_CF_TOKEN}
+CF_TOKEN=${CF_TOKEN}
 CREATED_USER=${CREATED_USER}
 MARKER_VERSION=${VERSION}
 ACME_HOME=${ACME_HOME}
@@ -3250,8 +3107,7 @@ MARKER_CREATED=$(date +%Y%m%d_%H%M%S)
 SMFI
 
   setup_fallback_decoy
-  # [HIGH FIX] Move issue_certificate AFTER create_systemd_service to avoid race condition
-  # where cert reload script tries to reload a service that doesn't exist yet
+  issue_certificate "$DOMAIN" "$CF_TOKEN"
 
   # 🔴 GPT: save_node_info 推迟到 sync+service+firewall 全部成功后原子提交
   # tmp-*.conf 供 sync_xray_config(glob *.conf) 读取；setup_firewall 排除 tmp-* 故 mv 后再生效
@@ -3271,16 +3127,21 @@ SMFI
   export _CAP_LINE _CAP_BOUND
 
   if ! ( sync_xray_config ); then
+    if [[ -f "${ACME_HOME}/acme.sh" ]]; then
+      "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
+      rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
+    fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
     _release_lock; exit 1
   fi
   if ! ( create_systemd_service ); then
+    if [[ -f "${ACME_HOME}/acme.sh" ]]; then
+      "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
+      rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
+    fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
     _release_lock; exit 1
   fi
-
-  # [HIGH FIX] Issue certificate AFTER service is created so reload script can check unit file
-  issue_certificate "$DOMAIN" "$CF_TOKEN"
 
   # Node file already at final path; reset trap to standard
   trap '_global_cleanup; rm -f "${_staged_fi_mgr:-}" 2>/dev/null; echo -e "\n${RED}[中断] 请执行: bash $0 --uninstall${NC}"; exit 1' INT TERM
