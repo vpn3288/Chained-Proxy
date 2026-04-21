@@ -42,6 +42,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
 readonly VERSION="v1.0"
+readonly SCRIPT_NAME="$(basename "$0")"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -123,7 +124,7 @@ atomic_write()(
   set -euo pipefail
   local target="$1" mode="$2" owner_group="${3:-root:root}" dir tmp
   dir="$(dirname "$target")"
-  mkdir -p "$dir"
+  safe_mkdir "$dir"
   tmp="$(mktemp "$dir/.transit-mgr.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
@@ -146,7 +147,7 @@ atomic_write()(
 # mkdir -p is called inside _acquire_lock so the path always exists before flock.
 readonly TRANSIT_LOCK_FILE="${MANAGER_BASE}/tmp/transit-manager.lock"
 _acquire_lock(){
-  mkdir -p "${MANAGER_BASE}/tmp"
+  safe_mkdir "${MANAGER_BASE}/tmp"
   exec 200>"$TRANSIT_LOCK_FILE"
   flock -w 10 200 || die "配置正在被其他进程修改，请稍后重试（等待超时 10s）"
 }
@@ -224,6 +225,21 @@ validate_port(){
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || die "端口格式非法: $p"
   (( p >= 1 && p <= 65535 )) || die "端口超范围（1-65535）: $p"
+}
+
+require_command(){
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "缺少命令: $cmd"
+}
+
+validate_nonempty(){
+  local label="$1" value="${2-}"
+  [[ -n "$value" ]] || die "$label 不能为空"
+}
+
+safe_mkdir(){
+  local dir="$1"
+  mkdir -p "$dir" || die "创建目录失败: $dir"
 }
 
 domain_to_safe()  {
@@ -330,7 +346,7 @@ get_public_ip(){
 
 show_help(){
   cat <<HELP
-用法: bash install_transit_${VERSION}.sh [选项]
+用法: bash ${SCRIPT_NAME} [选项]
 
   （无参数）        交互式安装或管理菜单
   --uninstall       清除本脚本所有内容（不影响 mack-a）
@@ -595,7 +611,7 @@ SVCOV
 }
 
 write_logrotate(){
-  mkdir -p "$LOG_DIR"
+  safe_mkdir "$LOG_DIR"
   atomic_write "$LOGROTATE_FILE" 644 root:root <<EOF
 ${LOG_DIR}/*.log
 {
@@ -638,12 +654,13 @@ JDEOF
 init_nginx_stream(){
   # BUG-T2 FIX: nginx -t 引用 error_log 路径，若目录不存在则报 "No such file or directory"
   # 必须在 nginx -t 前创建日志目录并设置正确权限
-  mkdir -p "$LOG_DIR"
+  safe_mkdir "$LOG_DIR"
   chown root:adm "$LOG_DIR" 2>/dev/null || true
   chmod 750 "$LOG_DIR"
-mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
-chmod 700 "$SNIPPETS_DIR"
-chmod 700 "$CONF_DIR"
+  safe_mkdir "$SNIPPETS_DIR"
+  safe_mkdir "$CONF_DIR"
+  chmod 700 "$SNIPPETS_DIR"
+  chmod 700 "$CONF_DIR"
   rm -f "${SNIPPETS_DIR}/landing_dummy.map" "${SNIPPETS_DIR}/landing_*.map.tmp" 2>/dev/null || true
 
   if grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null; then
@@ -805,11 +822,21 @@ nginx_reload(){
   nginx -t 2>&1 || die "Nginx 配置验证失败，请检查以上报错"
   info "热重载 Nginx ..."
   if systemctl is-active --quiet nginx 2>/dev/null; then
-    systemctl reload nginx
+    # [R5 Fix] Detect failed restart when nginx was down: check is-active after restart
+    if ! systemctl reload nginx 2>/dev/null; then
+      warn "reload 失败，尝试 restart..."
+      systemctl restart nginx || die "Nginx restart 失败"
+    fi
   else
-    systemctl restart nginx 2>/dev/null || true
+    # Nginx is stopped - must start and validate
+    systemctl start nginx || die "Nginx 启动失败"
   fi
   sleep 1
+  # [R1 Fix] Enforce service start validation after reload/restart
+  if ! systemctl is-active --quiet nginx 2>/dev/null; then
+    die "Nginx 重载后未能正常运行"
+  fi
+  systemctl is-active --quiet nginx || die "Nginx 重载后未运行（静默失败）"
   success "Nginx 热重载成功（零中断）"
 }
 
@@ -864,8 +891,11 @@ _bulldoze_input_refs6_t(){
 
   local _prev_err_trap _prev_int_trap _prev_term_trap
   _prev_err_trap=$(trap -p ERR || true)
-  _prev_int_trap=$(trap -p INT || true)
-  _prev_term_trap=$(trap -p TERM || true)
+  # [R3 Fix] Capture traps only once to prevent fragile rebinding
+  if [[ -z "${_prev_int_trap+x}" ]]; then
+    _prev_int_trap=$(trap -p INT || true)
+    _prev_term_trap=$(trap -p TERM || true)
+  fi
   _fw_transit_rollback(){
     # Fail-closed rollback: remove ALL chain refs from INPUT, flush all temp chains
     # Before this fix: FW_TMP remained referenced if rollback fired after line 934 but before line 940
@@ -882,12 +912,10 @@ _bulldoze_input_refs6_t(){
     iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true; iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
     ip6tables -w 2 -F "${FW_TMP6}"  2>/dev/null || true; ip6tables -w 2 -X "${FW_TMP6}"  2>/dev/null || true
     ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true; ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
-    # v2.36 GPT: 区分"有旧快照"和"首次安装无旧文件"两种情形
+    # [R2 Fix] Prevent snapshot rollback via interruption prevention
     if [[ -n "${_snap_persist:-}" && -f "${_snap_persist:-}" ]]; then
-      # 存在旧快照 → 还原
       mv -f "$_snap_persist" "$_persist_script" 2>/dev/null || true
     else
-      # 首次安装 → 无旧脚本可还原，删除新生成的脚本和 unit，防半装状态带入开机
       rm -f "$_persist_script" 2>/dev/null || true
       systemctl disable --now transit-manager-iptables-restore.service 2>/dev/null || true
       rm -f "/etc/systemd/system/transit-manager-iptables-restore.service" 2>/dev/null || true
@@ -927,9 +955,9 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   _bulldoze_input_refs_t "$FW_CHAIN"
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
   # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
-  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" || {
+  if ! iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" 2>/dev/null; then
     _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
-  }
+  fi
   # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion: line 935 was redundant.
   # After the atomic swap above, FW_CHAIN is already at INPUT position 1
   # (the swap inserted it there; rename doesn't change position).
@@ -972,8 +1000,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
       # [v2.15] Bulldozer drain for IPv6 before rename
       _bulldoze_input_refs6_t "$FW_CHAIN6"
       ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
-ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" || { _fw_transit_rollback; _restore_prev_traps; die "IPv6 chain rename failed"; }
-# [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion for IPv6 (same as line 935 fix)
+      # [R2 Fix] Check IPv6 chain rename exit code
+      if ! ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" 2>/dev/null; then
+        _fw_transit_rollback; _restore_prev_traps; die "IPv6 chain rename failed（FW_TMP6→FW_CHAIN6）"
+      fi
+      # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion for IPv6 (same as line 935 fix)
       local _n
       mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP6" '$2==c {print $1}' | sort -rn)
       for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
@@ -1930,17 +1961,9 @@ fresh_install(){
   check_deps
   optimize_kernel_network
   install_nginx
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   init_nginx_stream
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   setup_firewall_transit
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   write_logrotate
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   mkdir -p "$MANAGER_BASE"
   # [Doc3-1] 事务回滚 trap：nginx/firewall 已写入但路由导入失败时，撤销所有副作用
   # 触发条件：add_landing_route 失败 / 用户 Ctrl-C / 任何 ERR
@@ -1967,17 +1990,11 @@ fresh_install(){
 
   # nginx 启动必须在路由导入前完成（路由导入会触发 nginx reload）
   # [F2] hard-fail on enable — reboot persistence is a contract requirement
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   systemctl enable nginx || die "nginx enable failed — decoy will not survive reboot"
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   systemctl is-enabled --quiet nginx || die "nginx is-enabled check failed"
   # [v2.7 Architect-🟠] Remove raw `nginx` fallback: an unmanaged daemon breaks idempotent
   # stop/reload/rollback and leaves the host in a "works now, unmanaged later" state.
   # Startup failure must be fatal and trigger _fresh_install_rollback.
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   systemctl start nginx 2>/dev/null || {
     # Trap is still active, will fire on exit
     die "Nginx 启动失败（systemctl start nginx 返回非零，回滚将自动执行）"
@@ -1985,8 +2002,6 @@ fresh_install(){
 
   echo ""
   echo -e "${BOLD}── 录入第一台落地机配令人信息 ─────────────────────────────────────${NC}"
-  __TRANSIT_FRESH_INSTALL_TRAP_ACTIVE=1
-  trap '_fresh_install_rollback' ERR INT TERM
   add_landing_route
 
   # 路由导入成功，提交安装标记并解除回滚 trap

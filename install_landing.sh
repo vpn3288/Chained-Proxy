@@ -400,7 +400,9 @@ validate_domain(){
 
 validate_ipv4(){
   local ip="$1"
-  printf '%s' "$ip" | python3 -c "import ipaddress, sys
+  # [R1 Fix] Import Path to avoid NameError in embedded Python
+  printf '%s' "$ip" | python3 -c "from pathlib import Path
+import ipaddress, sys
 ip = sys.stdin.read().strip()
 try:
     addr = ipaddress.IPv4Address(ip)
@@ -1195,9 +1197,10 @@ for path in sorted(glob.glob(os.path.join(nodes_dir, '*.conf'))):
     # the outer subshell to exit non-zero so the bash die() + rollback path fires.
     if not dom or not pwd:
         raise ValueError(f"Corrupted node state in {path}: DOMAIN or PASSWORD missing")
+    from pathlib import Path
     cert_fullchain = f"{cert_base}/{dom}/fullchain.pem"
     cert_key       = f"{cert_base}/{dom}/key.pem"
-    if not os.path.exists(cert_fullchain) or not os.path.exists(cert_key):
+    if not Path(cert_fullchain).exists() or not Path(cert_key).exists():
         print(f"  [WARN] 域名 {dom} 证书文件不存在，跳过", flush=True)
         continue
     if dom not in certs_dict:
@@ -1603,6 +1606,12 @@ setup_firewall(){
     ip6tables -w 2 -D INPUT -m comment --comment "xray-landing-v6-swap" 2>/dev/null || true
     ip6tables -w 2 -F "$FW_TMP6" 2>/dev/null || true
     ip6tables -w 2 -X "$FW_TMP6" 2>/dev/null || true
+    # [R3 Fix] Remove stable jump rules on rollback
+    while iptables -w 2 -D INPUT -m comment --comment "xray-landing-jump" 2>/dev/null; do :; done
+    while ip6tables -w 2 -D INPUT -m comment --comment "xray-landing-v6-jump" 2>/dev/null; do :; done
+    # Also remove uncommented jump rules to prevent orphaned references
+    while iptables -w 2 -D INPUT -j "$FW_CHAIN" 2>/dev/null; do :; done
+    while ip6tables -w 2 -D INPUT -j "$FW_CHAIN6" 2>/dev/null; do :; done
   }
   _restore_prev_fw_traps(){
     eval "${_prev_err_trap:-trap - ERR}"
@@ -1669,16 +1678,19 @@ setup_firewall(){
   # direct -j before -F/-X/-E. The old while-loop approach missed rules with unexpected comments.
   _bulldoze_input_refs "$FW_CHAIN"
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-  iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" \
-    || { _fw_landing_rollback; _restore_prev_fw_traps; die "防火墙链重命名失败（iptables -E），运行链已回滚"; }
+  # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
+  if ! iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" 2>/dev/null; then
+    _fw_landing_rollback; _restore_prev_fw_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
+  fi
   iptables -w 2 -I INPUT 1 -m comment --comment "xray-landing-jump" -j "$FW_CHAIN"
   while iptables -w 2 -D INPUT -m comment --comment "xray-landing-swap" 2>/dev/null; do :; done
 
   if have_ipv6; then
     ip6tables -w 2 -N "$FW_TMP6" 2>/dev/null || ip6tables -w 2 -F "$FW_TMP6"
-    ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # [R2 Fix] Correct rule order: lo → SSH → ESTABLISHED → INVALID DROP
     ip6tables -w 2 -A "$FW_TMP6" -i lo -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p tcp      --dport "$ssh_port"     -j ACCEPT
+    ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -m conntrack --ctstate INVALID,UNTRACKED -j DROP
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type destination-unreachable -m comment --comment "xray-landing-icmp6" -j ACCEPT
     ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type packet-too-big -m comment --comment "xray-landing-icmp6-pmtud" -j ACCEPT
@@ -1695,15 +1707,26 @@ setup_firewall(){
     ip6tables -w 2 -A "$FW_TMP6" -j DROP
     ip6tables -w 2 -I INPUT 1 -m comment --comment "xray-landing-v6-swap" -j "$FW_TMP6"
     # [v2.15] Bulldozer drain for IPv6 chain before rename
-    _bulldoze_input_refs6 "$FW_CHAIN6"
+    _bulldoze_input_refs6 "$FW_CHAIN6" || { _fw_landing_rollback; _restore_prev_fw_traps; die "IPv6 chain drain failed"; }
     ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
-    ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6"
-    ip6tables -w 2 -I INPUT 1 -m comment --comment "xray-landing-v6-jump" -j "$FW_CHAIN6"
+    # [R2 Fix] Check IPv6 chain rename exit code
+    if ! ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" 2>/dev/null; then
+      _fw_landing_rollback; _restore_prev_fw_traps; die "IPv6 chain rename failed（FW_TMP6→FW_CHAIN6）"
+    fi
+    if ! ip6tables -w 2 -I INPUT 1 -m comment --comment "xray-landing-v6-jump" -j "$FW_CHAIN6"; then
+      _fw_landing_rollback; _restore_prev_fw_traps; die "IPv6 jump rule insertion failed"
+    fi
     while ip6tables -w 2 -D INPUT -m comment --comment "xray-landing-v6-swap" 2>/dev/null; do :; done
   fi
 
-  # v2.37 GPT: trap 保持活跃直到 _persist_iptables 成功，防运行链/开机链分裂
+  # [R3 Fix] Firewall rollback: remove stable jump/chain on persist failure
   if ! _persist_iptables "$ssh_port"; then
+    _bulldoze_input_refs "$FW_CHAIN"
+    iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
+    if have_ipv6; then
+      _bulldoze_input_refs6 "$FW_CHAIN6"
+      ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
+    fi
     _fw_landing_rollback
     _restore_prev_fw_traps
     die "防火墙持久化失败（firewall-restore.sh/unit 写入异常），运行链已回滚"
