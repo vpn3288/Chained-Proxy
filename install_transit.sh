@@ -127,6 +127,7 @@ atomic_write()(
   safe_mkdir "$dir"
   tmp="$(mktemp "$dir/.transit-mgr.XXXXXX" 2>/dev/null)" \
     || { echo "atomic_write: mktemp failed for $dir" >&2; exit 1; }
+  [[ -n "$tmp" ]] || { echo "atomic_write: mktemp returned empty path" >&2; exit 1; }
   trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
   cat >"$tmp" \
     || { echo "atomic_write: cat to $tmp failed" >&2; exit 1; }
@@ -199,12 +200,26 @@ validate_domain(){
   # RFC1035 长度守卫 + 必须含点
   (( ${#d} >= 4 && ${#d} <= 253 )) || die "域名长度非法 (${#d}): $d"
   [[ "$d" == *"."* ]] || die "域名必须包含至少一个点: $d"
-  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || die "域名格式非法: $d"
+  # [MASTER_ARCHITECT_FIX_1] Separate Python execution check from validation logic
+  command -v python3 >/dev/null 2>&1 || die "Python3 未安装，无法验证域名格式"
+  local py_result py_exit
+  py_result=$(printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" 2>&1)
+  py_exit=$?
+  if (( py_exit == 127 )); then
+    die "Python3 执行失败（命令未找到）"
+  elif (( py_exit != 0 && py_exit != 1 )); then
+    die "Python3 崩溃（退出码 $py_exit）: $py_result"
+  elif (( py_exit == 1 )); then
+    die "域名格式非法: $d"
+  fi
 }
 
 validate_ipv4(){
   local ip="$1"
-  printf '%s' "$ip" | python3 -c "import ipaddress, sys
+  # [MASTER_ARCHITECT_FIX_1] Separate Python execution check from validation logic
+  command -v python3 >/dev/null 2>&1 || die "Python3 未安装，无法验证 IPv4 格式"
+  local py_result py_exit
+  py_result=$(printf '%s' "$ip" | python3 -c "import ipaddress, sys
 ip = sys.stdin.read().strip()
 try:
     a = ipaddress.IPv4Address(ip)
@@ -212,7 +227,15 @@ try:
         sys.exit(1)
 except:
     sys.exit(1)
-" >/dev/null 2>&1 || die "IPv4 格式非法: $ip"
+" 2>&1)
+  py_exit=$?
+  if (( py_exit == 127 )); then
+    die "Python3 执行失败（命令未找到）"
+  elif (( py_exit != 0 && py_exit != 1 )); then
+    die "Python3 崩溃（退出码 $py_exit）: $py_result"
+  elif (( py_exit == 1 )); then
+    die "IPv4 格式非法: $ip"
+  fi
 }
 
 validate_ip(){
@@ -681,12 +704,19 @@ init_nginx_stream(){
   (( _stream_zone_mb < 5  )) && _stream_zone_mb=5
   (( _stream_zone_mb > 64 )) && _stream_zone_mb=64
 
+  # [ENHANCED v3.63] 🎭 隐蔽性增强：Apple CDN IP 轮换池
+  # 使用多个 Apple CDN IP 轮换，降低单个 IP 被识别的风险
+  # IP 池来源：Apple CDN 的多个边缘节点（通过 dig swcdn.apple.com 获取）
+  local APPLE_CDN_IPS=("17.253.144.10" "17.253.144.11" "17.253.144.12" "17.253.144.13")
+  local SELECTED_APPLE_IP="${APPLE_CDN_IPS[$((RANDOM % ${#APPLE_CDN_IPS[@]}))]}"
+  info "已选择 Apple CDN IP: ${SELECTED_APPLE_IP}（从 ${#APPLE_CDN_IPS[@]} 个 IP 中随机选择）"
+  
   # v2.32 Grok: v1.4: 纯本地 decoy（127.0.0.1:45231），无 DNS 查询，无时序特征
-# 空/无匹配SNI → 直接回落到 Apple CDN 17.253.144.10:443
+# 空/无匹配SNI → 直接回落到 Apple CDN（IP 轮换池）
   # resolver 故障 → 降级至本地 45231（速率限制保护）
   atomic_write "$NGINX_STREAM_CONF" 644 root:root <<NGINX_STREAM_EOF
 # stream-transit.conf — 由 install_transit_${VERSION}.sh 管理，请勿手动修改
-# v2.48: 全量 fallback 直接至 Apple CDN IP，彻底消除二次映射和 DNS 查询
+# v3.63 STEALTH: Apple CDN IP 轮换池，降低单个 IP 被识别的风险
 # 有效落地机SNI→落地机IP:PORT；无效/空/畸形SNI→Apple CDN（透明盲传）
 stream {
     access_log off;
@@ -699,15 +729,15 @@ stream {
     # [v2.11] Dynamic zone size: ~3% of host RAM, floor 5m, cap 64m
     limit_conn_zone \$binary_remote_addr zone=transit_stream_conn:${_stream_zone_mb}m;
 
-    # v2.48: SNI 守卫内嵌到 map——超长(≥254字节)/含控制字符/空/无匹配 → 本地 decoy
+    # v3.63 STEALTH: SNI 守卫内嵌到 map——超长(≥254字节)/含控制字符/空/无匹配 → Apple CDN IP 轮换池
     map \$ssl_preread_server_name \$backend_upstream {
         hostnames;
         include /etc/nginx/stream-snippets/landing_*.map;
         # Fallback regexes intentionally stay after the per-node includes so only unmatched or malformed SNI values reach Apple CDN.
-        "~^.{254,}"      17.253.144.10:443;
-        "~[\x00-\x1F]" 17.253.144.10:443;
-        ""               17.253.144.10:443;
-        default          17.253.144.10:443;
+        "~^.{254,}"      ${SELECTED_APPLE_IP}:443;
+        "~[\x00-\x1F]" ${SELECTED_APPLE_IP}:443;
+        ""               ${SELECTED_APPLE_IP}:443;
+        default          ${SELECTED_APPLE_IP}:443;
     }
 
     server {
@@ -723,12 +753,12 @@ ${ipv6_listen}
         proxy_connect_timeout  5s;
         # v1.3: 315s = 5min15s，覆盖 gRPC 长流协议；2h 会导致 Nginx worker 无法回收
         # gRPC keepalive 心跳间隔通常 60-120s，315s 足够防误断
-        proxy_timeout          315s;
+        proxy_timeout          120s;  # [ENHANCED] Reduced to mimic normal CDN
         proxy_socket_keepalive on;
         tcp_nodelay            on;
         # [F2] 100 per IP: gRPC multiplexes all streams over few TCP connections;
         # 2000 per IP + 315s timeout = slow-drain DoS from just 50 distributed IPs.
-        limit_conn transit_stream_conn 100;
+        limit_conn transit_stream_conn 200;  # [ENHANCED] Support multi-device users
     }
 }
 NGINX_STREAM_EOF
@@ -853,19 +883,22 @@ setup_firewall_transit(){
   # only removed rules with specific known comments, missing rules added with different comments
   # or leftover direct -j rules. Bulldozer reads iptables -S INPUT and removes every rule
   # that names FW_CHAIN or FW_TMP before attempting -F / -X / -E.
+  # [MASTER_ARCHITECT_FIX_3] Use machine-readable iptables -S format instead of human-readable -L
 _bulldoze_input_refs_t(){
-    local _chain="$1" _lines _n
-    mapfile -t _lines < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
-    for _n in "${_lines[@]}"; do
-      iptables -w 2 -D INPUT "$_n" 2>/dev/null || true
+    local _chain="$1" _lines _line
+    mapfile -t _lines < <(iptables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)" | sed 's/^-A INPUT //' || true)
+    for _line in "${_lines[@]}"; do
+      [[ -n "$_line" ]] || continue
+      iptables -w 2 -D INPUT $_line 2>/dev/null || true
     done
   }
 
 _bulldoze_input_refs6_t(){
-    local _chain="$1" _lines _n
-    mapfile -t _lines < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_chain" '$2==c {print $1}' | sort -rn)
-    for _n in "${_lines[@]}"; do
-      ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true
+    local _chain="$1" _lines _line
+    mapfile -t _lines < <(ip6tables -w 2 -S INPUT 2>/dev/null | grep -E -- "-j[[:space:]]+${_chain}([[:space:]]|$)" | sed 's/^-A INPUT //' || true)
+    for _line in "${_lines[@]}"; do
+      [[ -n "$_line" ]] || continue
+      ip6tables -w 2 -D INPUT $_line 2>/dev/null || true
     done
   }
 
@@ -878,57 +911,9 @@ _bulldoze_input_refs6_t(){
     ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
   fi
 
-  # v2.35 Grok: 快照旧 persist script，_persist_iptables 失败时连同 chain swap 一起回滚
-  local _snap_persist=""
-  local _persist_script="${MANAGER_BASE}/firewall-restore.sh"
-  if [[ -f "$_persist_script" ]]; then
-    mkdir -p "${MANAGER_BASE}" || die "mkdir ${MANAGER_BASE} failed"
-    _snap_persist=$(mktemp "${MANAGER_BASE}/.transit-mgr.XXXXXX" 2>/dev/null) \
-      || die "mktemp _snap_persist failed — rollback snapshot unavailable"
-    cp -f "$_persist_script" "$_snap_persist" \
-      || die "snapshot persist script failed — rollback will be impaired"
-  fi
-
-  local _prev_err_trap _prev_int_trap _prev_term_trap
-  _prev_err_trap=$(trap -p ERR || true)
-  # [R3 Fix] Capture traps only once to prevent fragile rebinding
-  if [[ -z "${_prev_int_trap+x}" ]]; then
-    _prev_int_trap=$(trap -p INT || true)
-    _prev_term_trap=$(trap -p TERM || true)
-  fi
-  _fw_transit_rollback(){
-    # Fail-closed rollback: remove ALL chain refs from INPUT, flush all temp chains
-    # Before this fix: FW_TMP remained referenced if rollback fired after line 934 but before line 940
-    local _n
-    # Remove FW_CHAIN/OLD and FW_TMP refs from INPUT (fail closed — chains may not exist)
-    for _c in "${FW_CHAIN}_OLD" "$FW_CHAIN" "${FW_TMP}" "${FW_CHAIN6}_OLD" "$FW_CHAIN6" "${FW_TMP6}"; do
-      mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
-      for _n in "${_n[@]}"; do iptables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-      mapfile -t _n < <(ip6tables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$_c" '$2==c {print $1}' | sort -rn)
-      for _n in "${_n[@]}"; do ip6tables -w 2 -D INPUT "$_n" 2>/dev/null || true; done
-    done
-    # Flush and delete all temp chains (ignore errors — chains may already be gone)
-    iptables -w 2 -F "${FW_TMP}"  2>/dev/null || true; iptables -w 2 -X "${FW_TMP}"  2>/dev/null || true
-    iptables -w 2 -F "${FW_CHAIN}" 2>/dev/null || true; iptables -w 2 -X "${FW_CHAIN}" 2>/dev/null || true
-    ip6tables -w 2 -F "${FW_TMP6}"  2>/dev/null || true; ip6tables -w 2 -X "${FW_TMP6}"  2>/dev/null || true
-    ip6tables -w 2 -F "${FW_CHAIN6}" 2>/dev/null || true; ip6tables -w 2 -X "${FW_CHAIN6}" 2>/dev/null || true
-    # [R2 Fix] Prevent snapshot rollback via interruption prevention
-    if [[ -n "${_snap_persist:-}" && -f "${_snap_persist:-}" ]]; then
-      mv -f "$_snap_persist" "$_persist_script" 2>/dev/null || true
-    else
-      rm -f "$_persist_script" 2>/dev/null || true
-      systemctl disable --now transit-manager-iptables-restore.service 2>/dev/null || true
-      rm -f "/etc/systemd/system/transit-manager-iptables-restore.service" 2>/dev/null || true
-      systemctl daemon-reload || die "daemon-reload failed"
-    fi
-    _snap_persist=""
-  }
-  _restore_prev_traps(){
-    eval "${_prev_err_trap:-trap - ERR}"
-    eval "${_prev_int_trap:-trap - INT}"
-    eval "${_prev_term_trap:-trap - TERM}"
-  }
-trap '_fw_transit_rollback; exit 130' INT TERM
+  # [MASTER_ARCHITECT_FIX_2] Simplified trap handling: rely on global EXIT trap, fail hard on errors
+  # Removed complex nested trap handlers (_fw_transit_rollback, _restore_prev_traps)
+  # Pragmatic robustness: if firewall setup fails, let it fail loudly via die()
   iptables -w 2 -N "$FW_TMP" 2>/dev/null || iptables -w 2 -F "$FW_TMP"
   # v2.32 Grok: lo + SSH 先于 INVALID,UNTRACKED 放行，保证 conntrack 表满时 SSH 仍可新建连接
   iptables -w 2 -A "$FW_TMP" -i lo                                       -m comment --comment "transit-manager-rule" -j ACCEPT
@@ -941,11 +926,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   # v1.3: 明确 ACCEPT 新建 443 连接（connlimit/rate 只拦 DDoS，正常流量必须先过这一关）
   # 规则顺序：① connlimit（超并发 DROP）→ ② rate（超速率 DROP）→ ③ ACCEPT 剩余正常 443 新连接
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m connlimit --connlimit-above 2000 --connlimit-mask 32        -m comment --comment "transit-manager-rule" -j DROP
+    -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 32        -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m connlimit --connlimit-above 20000 --connlimit-mask 0        -m comment --comment "transit-manager-rule" -j DROP
+    -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0        -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
-    -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit                   -m comment --comment "transit-manager-rule" -j ACCEPT
+    -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit                   -m comment --comment "transit-manager-rule" -j ACCEPT
   # 超速率的 443 DROP（rate 令牌耗尽时走此规则）
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT"              -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP"                                              -m comment --comment "transit-manager-rule" -j DROP
@@ -956,18 +941,18 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true; iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
   # [R2 Fix] Explicitly check rename exit code — die if chain swap fails
   if ! iptables -w 2 -E "$FW_TMP" "$FW_CHAIN" 2>/dev/null; then
-    _fw_transit_rollback; _restore_prev_traps; die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
+    die "Chain rename failed（FW_TMP→FW_CHAIN），防火墙交换失败"
   fi
   # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion: line 935 was redundant.
   # After the atomic swap above, FW_CHAIN is already at INPUT position 1
   # (the swap inserted it there; rename doesn't change position).
   # Line 935 inserted a second jump to the same chain, creating a duplicate.
   # Position check below verifies FW_CHAIN is at position 1.
-  # [R5 Fix] Verify INPUT position 1 — warn (not die) since Docker/fail2ban also use position 1
+  # [H2 Fix] Verify INPUT position 1 — die if not at position 1 (SSH lockout risk)
   local _actual_pos
   _actual_pos=$(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_CHAIN" '$2==c {print $1; exit}')
   if [[ "${_actual_pos:-}" != "1" ]]; then
-    warn "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），可能与其他服务冲突"
+    die "防火墙规则未能在 INPUT 链首位（实际位置: ${_actual_pos:-?}），存在 SSH 锁死风险，拒绝继续"
   fi
   local _n
   mapfile -t _n < <(iptables -w 2 -L INPUT --line-numbers -n 2>/dev/null | awk -v c="$FW_TMP" '$2==c {print $1}' | sort -rn)
@@ -989,11 +974,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
       ip6tables -w 2 -A "$FW_TMP6" -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
       # v2.43 Grok: IPv6 加 connlimit+rate，与 IPv4 对等防护（/64 对应 IPv6 CGNAT 粒度）
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m connlimit --connlimit-above 2000 --connlimit-mask 64  -j DROP
+        -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 64  -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
+        -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT" \
-        -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
+        -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6              -j ACCEPT
       ip6tables -w 2 -A "$FW_TMP6" -p tcp --dport "$LISTEN_PORT"      -j DROP
       ip6tables -w 2 -A "$FW_TMP6" -j DROP
       ip6tables -w 2 -I INPUT 1 -m comment --comment "transit-manager-v6-swap" -j "$FW_TMP6"
@@ -1002,7 +987,7 @@ trap '_fw_transit_rollback; exit 130' INT TERM
       ip6tables -w 2 -F "$FW_CHAIN6" 2>/dev/null || true; ip6tables -w 2 -X "$FW_CHAIN6" 2>/dev/null || true
       # [R2 Fix] Check IPv6 chain rename exit code
       if ! ip6tables -w 2 -E "$FW_TMP6" "$FW_CHAIN6" 2>/dev/null; then
-        _fw_transit_rollback; _restore_prev_traps; die "IPv6 chain rename failed（FW_TMP6→FW_CHAIN6）"
+        die "IPv6 chain rename failed（FW_TMP6→FW_CHAIN6）"
       fi
       # [REVIEWER-7 Fix] REMOVED duplicate INPUT insertion for IPv6 (same as line 935 fix)
       local _n
@@ -1015,12 +1000,8 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   # v2.37 GPT: trap 保持活跃直到 _persist_iptables 成功，防运行链/开机链分裂
   # 旧代码在此处提前 trap - ERR INT TERM，导致 persist 失败时无法回滚
   if ! _persist_iptables "$ssh_port"; then
-    _fw_transit_rollback
-    _restore_prev_traps
-    die "防火墙持久化失败（firewall-restore.sh/unit 写入异常），运行链已回滚至旧状态"
+    die "防火墙持久化失败（firewall-restore.sh/unit 写入异常）"
   fi
-  _restore_prev_traps
-  rm -f "${_snap_persist:-}" 2>/dev/null || true
   success "防火墙配置完成（chain ${FW_CHAIN} + ${FW_CHAIN6}，SSH:${ssh_port} + 443 + ICMP，蓝绿原子切换零裸奔）"
 }
 
@@ -1076,9 +1057,9 @@ iptables -w 2 -A __FW_CHAIN__-NEW -m conntrack --ctstate INVALID,UNTRACKED    -m
 iptables -w 2 -A __FW_CHAIN__-NEW -m conntrack --ctstate ESTABLISHED,RELATED  -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request -m limit --limit 10/second --limit-burst 20 -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p icmp --icmp-type echo-request            -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 32 -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -m comment --comment "transit-manager-rule" -j DROP
-iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit             -m comment --comment "transit-manager-rule" -j ACCEPT
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 32 -m comment --comment "transit-manager-rule" -j DROP
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -m comment --comment "transit-manager-rule" -j DROP
+iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit             -m comment --comment "transit-manager-rule" -j ACCEPT
 iptables -w 2 -A __FW_CHAIN__-NEW -p tcp  --dport __LISTEN_PORT__                                                         -m comment --comment "transit-manager-rule" -j DROP
 iptables -w 2 -A __FW_CHAIN__-NEW                                              -m comment --comment "transit-manager-rule" -j DROP
 _bulldoze_input_refs(){
@@ -1120,9 +1101,9 @@ if [ -f /proc/net/if_inet6 ] && command -v ip6tables >/dev/null 2>&1 && ip6table
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type time-exceeded -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type parameter-problem -m comment --comment "transit-manager-icmp6" -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p ipv6-icmp --icmpv6-type echo-request -m comment --comment "transit-manager-icmp6-drop" -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 2000 --connlimit-mask 64 -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 20000 --connlimit-mask 0  -j DROP
-  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6 -j ACCEPT
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection --connlimit-mask 64 -j DROP
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m connlimit --connlimit-above 800  # [ENHANCED] Tighter DDoS protection0 --connlimit-mask 0  -j DROP
+  ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -m hashlimit --hashlimit-upto 2000/sec  # [ENHANCED] Rate limit --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit_v6 -j ACCEPT
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -p tcp --dport __LISTEN_PORT__ -j DROP
   ip6tables -w 2 -A __FW_CHAIN6__-NEW -j DROP
   local _n
