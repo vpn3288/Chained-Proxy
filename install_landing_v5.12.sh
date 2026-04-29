@@ -980,7 +980,7 @@ _write_cert_reload_script(){
   # [R11 Fix] Use quoted heredoc <<'RELOAD_EOF' so ${CERT_DIR} and other
   # variables are written literally (expanded at runtime by acme.sh, not during cat).
   # [C2 Fix] Ensure acme.sh cronjob cleanup is included in reload script
-  (atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<'RELOAD_EOF'
+  atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<'RELOAD_EOF' || die "证书重载脚本创建失败"
 #!/usr/bin/env bash
 # xray-landing-reload-v\${VERSION}
 set -eu
@@ -1037,7 +1037,6 @@ fi
 # Exit 0 so acme.sh considers renewal successful
 exit 0
 RELOAD_EOF
-  )
 }
 
 issue_certificate(){
