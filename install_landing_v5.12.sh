@@ -927,8 +927,8 @@ setup_fallback_decoy(){
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
     server_name _;
     server_tokens off;
     limit_conn fallback_conn 4;
@@ -948,8 +948,8 @@ FDEOF
 limit_conn_zone $binary_remote_addr zone=fallback_conn:10m;
 limit_req_zone  $binary_remote_addr zone=fallback_req:10m rate=10r/s;
 server {
-    listen 127.0.0.1:45231 http2;
-    listen 127.0.0.1:45232 http2;
+    listen 127.0.0.1:45231;
+    listen 127.0.0.1:45232;
     server_name _;
     server_tokens off;
     limit_conn fallback_conn 4;
