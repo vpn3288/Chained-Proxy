@@ -536,7 +536,7 @@ HELP
 }
 
 get_public_ip(){
-  trap 'IFS=$'\n\t'' RETURN  # Restore script-global IFS
+  trap 'IFS=$'"'"'\n\t'"'"'' RETURN  # Restore script-global IFS
   local ip=""
   local src attempt
   for attempt in 1 2; do
@@ -3354,6 +3354,48 @@ fresh_install(){
     warn "检测到 mack-a 已安装，本落地机将与其共享端口，请确认无冲突"
   fi
   __LANDING_FRESH_INSTALL_TRAP_ACTIVE=1
+  
+  # [BUG-6 FIX] Define rollback function BEFORE setting trap
+  _fresh_install_rollback(){
+    [[ "${__LANDING_FRESH_INSTALL_TRAP_ACTIVE:-0}" == "1" ]] || return 0
+    warn "[rollback] 安装中断，清理半成品..."
+    systemctl stop    "$LANDING_SVC"   2>/dev/null || true
+    systemctl disable "$LANDING_SVC"   2>/dev/null || true
+    rm -f "/etc/systemd/system/${LANDING_SVC}" \
+          "/etc/systemd/system/xray-landing-recovery.service" 2>/dev/null || true
+    # [F4] Also clean nginx fallback artifacts — without this, next run finds Nginx already
+    # configured and enters inconsistent state thinking setup_fallback_decoy already ran.
+    rm -f "/etc/nginx/conf.d/xray-landing-fallback.conf" 2>/dev/null || true
+    rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    while iptables -w 2 -D INPUT -j "$FW_CHAIN" 2>/dev/null; do :; done
+    iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true
+    iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
+    # [F3] Clean installed binary and assets — install_xray_binary() runs before this trap
+    # fires; leaving the binary creates a contaminated host state on the next run.
+    rm -f "$LANDING_BIN" "$CERT_RELOAD_SCRIPT" "$LOGROTATE_FILE" 2>/dev/null || true
+    rm -rf /usr/local/share/xray-landing 2>/dev/null || true
+    # Also clear recovery lockfile so a future fresh install doesn't trip the 1800s cooldown
+    rm -f /run/lock/xray-landing-recovery.last 2>/dev/null || true
+    # [C2 Fix] Uninstall acme.sh cronjob during rollback to prevent orphaned cron entries
+    if [[ -f "${ACME_HOME}/acme.sh" ]]; then
+      env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" --uninstall-cronjob 2>/dev/null || true
+    fi
+    # [v2.11 Doc10-C-🔴] Remove acme.sh domain registration before wiping cert dirs.
+    # Without this, acme.sh cron keeps firing reloadcmd for a domain that no longer has
+    # a service — causing spurious reload failures and cron log noise indefinitely.
+    if [[ -n "${DOMAIN:-}" && -f "${ACME_HOME}/acme.sh" ]]; then
+      env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" \
+        --home "${ACME_HOME}" --remove --domain "${DOMAIN}" --ecc 2>/dev/null || true
+    fi
+    # [F4] Remove cert and config dirs so next run starts clean
+    rm -rf "$CERT_BASE" "$LANDING_BASE" 2>/dev/null || true
+    rm -f "$INSTALLED_FLAG" "$MANAGER_CONFIG" 2>/dev/null || true
+    rm -f "${_staged_fi_mgr:-}" 2>/dev/null || true   # [v2.8] purge staged manager.conf on rollback
+    rm -rf "${MANAGER_BASE}/nodes" 2>/dev/null || true
+    warn "[rollback] 完成，可安全重新运行安装"
+  }
+  
   trap '_fresh_install_rollback' ERR INT TERM
   optimize_kernel_network; create_system_user; install_xray_binary
 
@@ -3412,48 +3454,7 @@ fresh_install(){
 
   mkdir -p "$LANDING_BASE"
 
-  # [Fix-A / Doc8-GPT-🔴] Transaction trap: if anything from here to touch $INSTALLED_FLAG fails,
-  # roll back binary + unit + iptables so next run does not collide with a ghost half-install.
-  _fresh_install_rollback(){
-    [[ "${__LANDING_FRESH_INSTALL_TRAP_ACTIVE:-0}" == "1" ]] || return 0
-    warn "[rollback] 安装中断，清理半成品..."
-    systemctl stop    "$LANDING_SVC"   2>/dev/null || true
-    systemctl disable "$LANDING_SVC"   2>/dev/null || true
-    rm -f "/etc/systemd/system/${LANDING_SVC}" \
-          "/etc/systemd/system/xray-landing-recovery.service" 2>/dev/null || true
-    # [F4] Also clean nginx fallback artifacts — without this, next run finds Nginx already
-    # configured and enters inconsistent state thinking setup_fallback_decoy already ran.
-    rm -f "/etc/nginx/conf.d/xray-landing-fallback.conf" 2>/dev/null || true
-    rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    while iptables -w 2 -D INPUT -j "$FW_CHAIN" 2>/dev/null; do :; done
-    iptables -w 2 -F "$FW_CHAIN" 2>/dev/null || true
-    iptables -w 2 -X "$FW_CHAIN" 2>/dev/null || true
-    # [F3] Clean installed binary and assets — install_xray_binary() runs before this trap
-    # fires; leaving the binary creates a contaminated host state on the next run.
-    rm -f "$LANDING_BIN" "$CERT_RELOAD_SCRIPT" "$LOGROTATE_FILE" 2>/dev/null || true
-    rm -rf /usr/local/share/xray-landing 2>/dev/null || true
-    # Also clear recovery lockfile so a future fresh install doesn't trip the 1800s cooldown
-    rm -f /run/lock/xray-landing-recovery.last 2>/dev/null || true
-    # [C2 Fix] Uninstall acme.sh cronjob during rollback to prevent orphaned cron entries
-    if [[ -f "${ACME_HOME}/acme.sh" ]]; then
-      env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" --uninstall-cronjob 2>/dev/null || true
-    fi
-    # [v2.11 Doc10-C-🔴] Remove acme.sh domain registration before wiping cert dirs.
-    # Without this, acme.sh cron keeps firing reloadcmd for a domain that no longer has
-    # a service — causing spurious reload failures and cron log noise indefinitely.
-    if [[ -n "${DOMAIN:-}" && -f "${ACME_HOME}/acme.sh" ]]; then
-      env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" \
-        --home "${ACME_HOME}" --remove --domain "${DOMAIN}" --ecc 2>/dev/null || true
-    fi
-    # [F4] Remove cert and config dirs so next run starts clean
-    rm -rf "$CERT_BASE" "$LANDING_BASE" 2>/dev/null || true
-    rm -f "$INSTALLED_FLAG" "$MANAGER_CONFIG" 2>/dev/null || true
-    rm -f "${_staged_fi_mgr:-}" 2>/dev/null || true   # [v2.8] purge staged manager.conf on rollback
-    rm -rf "${MANAGER_BASE}/nodes" 2>/dev/null || true
-    warn "[rollback] 完成，可安全重新运行安装"
-  }
-  # rollback trap already registered above; keep a single guard to reduce control-flow drift
+  # [Fix-A / Doc8-GPT-🔴] Transaction trap already registered above
 
   # [v2.32 Bug-1 Fix] Ensure both MANAGER_BASE and its tmp subdir exist before mktemp
   mkdir -p "${MANAGER_BASE}/tmp"
