@@ -747,7 +747,7 @@ LimitNOFILE=${_tune_fd}
 TasksMax=infinity
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/var/log/nginx /var/lib/nginx
+ReadWritePaths=/var/log/nginx /var/lib/nginx /run /var/run
 ProtectHome=true
 PrivateTmp=true
 UMask=0027
@@ -1228,7 +1228,8 @@ trap '_fw_transit_rollback; exit 130' INT TERM
   
   # [T-HIGH-2-FIX] 验证 UDP 443（QUIC）封堵规则是否生效
   local _udp_drop_count
-  _udp_drop_count=$(iptables -w 2 -L "$FW_CHAIN" -n -v 2>/dev/null | grep -c "udp dpt:$LISTEN_PORT.*DROP" || echo 0)
+  _udp_drop_count=$(iptables -w 2 -L "$FW_CHAIN" -n -v 2>/dev/null | grep -c "udp dpt:$LISTEN_PORT.*DROP" 2>/dev/null || echo 0)
+  _udp_drop_count=$(echo "$_udp_drop_count" | tr -d '\r\n' | head -1)  # 清理换行符，防止语法错误
   if [[ "$_udp_drop_count" -ge 1 ]]; then
     success "UDP 443（QUIC）封堵规则已生效"
   else
