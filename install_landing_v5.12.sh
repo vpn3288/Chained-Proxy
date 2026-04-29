@@ -1138,7 +1138,7 @@ issue_certificate(){
       rm -rf "${_acme_tmp_home}"
       die "acme.sh 归档结构异常，解压后未找到 acme.sh"
     fi
-    env noprofile=1 HOME="${ACME_HOME}" sh "${_acme_src_dir}/acme.sh" --install \
+    env noprofile=1 HOME="${ACME_HOME}" sh "${_acme_src_dir}/acme.sh" --install --home "${ACME_HOME}" \
       || die "acme.sh 安装失败"
     rm -rf "${_acme_tmp_home}" 2>/dev/null || true
     [[ -f "${ACME_HOME}/acme.sh" ]]       || die "acme.sh 安装后在 ${ACME_HOME} 未找到 acme.sh，请检查安装器是否支持 --home"
