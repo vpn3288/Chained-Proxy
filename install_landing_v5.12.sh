@@ -1067,7 +1067,7 @@ issue_certificate(){
   local _zone_id
   _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10 \
     -H "Authorization: Bearer $cf_token" \
-    "https://api.cloudflare.com/client/v4/zones?name=${domain#*.}" \
+    "https://api.cloudflare.com/client/v4/zones?name=$domain" \
     2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
   if [[ -z "$_zone_id" ]]; then
     die "Cloudflare API Token 验证失败（无法获取 Zone ID），请检查 Token 权限（需要 Zone:DNS:Edit）"
