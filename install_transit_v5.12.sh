@@ -100,7 +100,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 worker_connections 注释覆盖逻辑，防止升级标签堆叠
 # - 保持 SNI 盲传与双栈防火墙结构不变
-readonly VERSION="v5.11"
+readonly VERSION="v5.12"
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }

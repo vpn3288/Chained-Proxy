@@ -213,7 +213,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 # - 修复 acme.sh 首次安装下载/执行缺失，恢复证书申请链路
 # - 将 INPUT 链清理改为行号删除，避免 save/restore 重放旧规则
 # - 修正 nginx worker_connections 注释覆盖逻辑，防止升级标签堆叠
-readonly VERSION="v5.11"
+readonly VERSION="v5.12"
 # v2.17: Gemini审计修复·gRPC fallback使用纯ALPN匹配
 # v2.15: 初始稳定版本
 
