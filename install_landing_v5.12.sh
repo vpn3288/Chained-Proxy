@@ -1393,6 +1393,7 @@ sync_xray_config(){
     done
     python3 - <<'PYEOF'
 import json, os, glob, uuid as _uuid, random as _rand
+from pathlib import Path
 
 nodes_dir    = os.environ['_NODES_DIR']
 cert_base    = os.environ['_CERT_BASE']
