@@ -2093,7 +2093,8 @@ _purge_bulldoze6(){
   sysctl --system &>/dev/null || true
   sed -i '/# xray-transit: raised for high-concurrency/,/^root hard nofile/d' /etc/security/limits.conf 2>/dev/null || true
   rm -f /var/run/transit-manager.update.warn 2>/dev/null || true
-  rm -f /etc/systemd/journald.conf.d/transit-manager.conf 2>/dev/null || true`n  rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
+  rm -f /etc/systemd/journald.conf.d/transit-manager.conf 2>/dev/null || true
+  rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
   [[ -z "$(ls -A /etc/systemd/journald.conf.d 2>/dev/null)" ]] && rmdir /etc/systemd/journald.conf.d 2>/dev/null || true
   systemctl restart systemd-journald 2>/dev/null || true
   rm -f "$LOGROTATE_FILE" 2>/dev/null || true

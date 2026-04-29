@@ -3145,7 +3145,8 @@ purge_all(){
   rm -f /etc/nginx/conf.d/xray-landing-fallback.conf 2>/dev/null || true
   rm -f "/etc/systemd/system/nginx.service.d/landing-override.conf" 2>/dev/null || true
   # v1.5: 清理新增的 drop-in 和 journald 上限配置
-  rm -f "/etc/systemd/system/xray-landing.service.d/xray-landing-limits.conf" 2>/dev/null || true`n  rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
+  rm -f "/etc/systemd/system/xray-landing.service.d/xray-landing-limits.conf" 2>/dev/null || true
+  rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
   rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
   rmdir "/etc/systemd/system/xray-landing.service.d" 2>/dev/null || true
   rm -f "/etc/systemd/journald.conf.d/xray-landing.conf" 2>/dev/null || true
