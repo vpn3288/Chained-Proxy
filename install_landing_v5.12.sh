@@ -982,12 +982,12 @@ _write_cert_reload_script(){
   # [C2 Fix] Ensure acme.sh cronjob cleanup is included in reload script
   atomic_write "$CERT_RELOAD_SCRIPT" 755 root:root <<'RELOAD_EOF' || die "证书重载脚本创建失败"
 #!/usr/bin/env bash
-# xray-landing-reload-v\${VERSION}
+# xray-landing-reload-v${VERSION}
 set -eu
-CERT_DIR="\${1:-}"
+CERT_DIR="${1:-}"
 # [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
-if [ -z "\$CERT_DIR" ] || [ ! -d "\$CERT_DIR" ]; then
-  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '\$CERT_DIR'"
+if [ -z "$CERT_DIR" ] || [ ! -d "$CERT_DIR" ]; then
+  logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '$CERT_DIR'"
   exit 1
 fi
 
@@ -1002,16 +1002,16 @@ if ! /bin/systemctl is-active --quiet xray-landing.service 2>/dev/null; then
 fi
 
 # 先修权限（依赖 reload 成功前确保权限正确）
-chown -R root:xray-landing "\$CERT_DIR" || true
-chmod 750 "\$CERT_DIR" || true
-chmod 644 "\$CERT_DIR/cert.pem" "\$CERT_DIR/fullchain.pem" || true
-chmod 640 "\$CERT_DIR/key.pem" || true
+chown -R root:xray-landing "$CERT_DIR" || true
+chmod 750 "$CERT_DIR" || true
+chmod 644 "$CERT_DIR/cert.pem" "$CERT_DIR/fullchain.pem" || true
+chmod 640 "$CERT_DIR/key.pem" || true
 
-if [[ ! -s "\${CERT_DIR}/fullchain.pem" ]]; then
+if [[ ! -s "${CERT_DIR}/fullchain.pem" ]]; then
   logger -t acme-xray-landing "ERROR: fullchain.pem is empty or missing"
   exit 1
 fi
-if openssl x509 -checkend 86400 -noout -in "\\${CERT_DIR}/fullchain.pem" 2>/dev/null; then
+if openssl x509 -checkend 86400 -noout -in "${CERT_DIR}/fullchain.pem" 2>/dev/null; then
   # 证书有效：Xray 需要 restart 加载新证书（reload 对 Xray 无效），使用 restart 避免 StartLimitBurst 消耗
   # [v2.10 Architect-🟠] Restart is the correct behavior for Xray cert reload. The reload attempt first
   # is for future-proofing if Xray ever supports in-place reload, but restart is the actual fallback.
@@ -1019,18 +1019,18 @@ if openssl x509 -checkend 86400 -noout -in "\\${CERT_DIR}/fullchain.pem" 2>/dev/
     # [v2.32 Fix] reload失败时尝试一次restart，再失败才退出
     logger -t acme-xray-landing "WARN: reload failed — attempting restart"
     if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
-        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "\\$_msg"; echo "\\$(date '+%Y-%m-%d %H:%M:%S') \\$_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
+        echo "xray restart failed — reload also failed earlier" >&2; _msg="FATAL: reload and restart both failed for xray-landing.service"; logger -t acme-xray-landing "$_msg"; echo "$(date '+%Y-%m-%d %H:%M:%S') $_msg" >> /var/log/acme-xray-landing-renew.log || true; exit 1
     fi
   fi
 else
   # Cert validation failed: FORCE service restart to attempt loading new cert
   _msg="WARN: 证书续期后校验失败，强制重启服务尝试加载"
-  logger -t acme-xray-landing "\\$_msg"
-  echo "\\$(date '+%Y-%m-%d %H:%M:%S') \\$_msg" >> /var/log/acme-xray-landing-renew.log || true
+  logger -t acme-xray-landing "$_msg"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $_msg" >> /var/log/acme-xray-landing-renew.log || true
   if ! /bin/systemctl restart xray-landing.service 2>/dev/null; then
     _msg="FATAL: 证书校验失败且服务重启失败"
-    logger -t acme-xray-landing "\\$_msg"
-    echo "\\$(date '+%Y-%m-%d %H:%M:%S') \\$_msg" >> /var/log/acme-xray-landing-renew.log || true
+    logger -t acme-xray-landing "$_msg"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $_msg" >> /var/log/acme-xray-landing-renew.log || true
     exit 1
   fi
 fi
