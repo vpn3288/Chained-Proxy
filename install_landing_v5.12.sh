@@ -1274,7 +1274,8 @@ for try in 1 2; do
   # [BUG #23 Debug] Output actual crontab content before validation
   info "调试：当前 crontab 中的 acme.sh 条目："
   crontab -l 2>/dev/null | grep acme || warn "未找到 acme 相关 cron 条目"
-  if ! crontab -l 2>/dev/null | grep -qF "${ACME_HOME}/acme.sh"; then
+  # [BUG #23 Fix] Match both quoted and unquoted formats: "/path"/acme.sh or /path/acme.sh
+  if ! crontab -l 2>/dev/null | grep -E "(\"${ACME_HOME}\"|${ACME_HOME})/acme\.sh" >/dev/null; then
     die "acme.sh cron 条目验收失败（未指向 ${ACME_HOME}/acme.sh），请手动执行: ${ACME_HOME}/acme.sh --install-cronjob"
   fi
   success "证书自动续期已配置并验收通过（acme.sh 原生 crontab）"
