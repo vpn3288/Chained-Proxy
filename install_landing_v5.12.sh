@@ -1260,10 +1260,14 @@ for try in 1 2; do
   # [v2.15 Bug Fix] acme.sh sometimes hard-codes /root/.acme.sh into the crontab entry even
   # when ACME_HOME is set (version-dependent behaviour). Rewrite any such paths to our actual
   # ACME_HOME so renewal keeps firing at the correct binary after the 60-day cycle.
-  # [BUG #23 Fix] Replace both ${HOME}/.acme.sh and /root/.acme.sh patterns
+  # [BUG #23 Fix] Replace both quoted and unquoted patterns, handle "/root/.acme.sh"/acme.sh format
   crontab -l 2>/dev/null \
+    | sed "s|\"${HOME}/.acme.sh\"|\"${ACME_HOME}\"|g" \
+    | sed "s|\"/root/.acme.sh\"|\"${ACME_HOME}\"|g" \
     | sed "s|${HOME}/.acme.sh/acme.sh|${ACME_HOME}/acme.sh|g" \
     | sed "s|/root/.acme.sh/acme.sh|${ACME_HOME}/acme.sh|g" \
+    | sed "s|--home \"${HOME}/.acme.sh\"|--home \"${ACME_HOME}\"|g" \
+    | sed "s|--home \"/root/.acme.sh\"|--home \"${ACME_HOME}\"|g" \
     | crontab - 2>/dev/null || true
   # Validation: accept either our ACME_HOME path or the legacy ~/.acme.sh path, since
   # some acme.sh versions write the cron entry using their compiled-in home path.
