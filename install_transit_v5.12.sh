@@ -1244,8 +1244,8 @@ _persist_iptables(){
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || die "SSH 端口非法（需为数字）: $ssh_port"
   (( ssh_port >= 1 && ssh_port <= 65535 )) || die "SSH 端口超范围 (1-65535): $ssh_port"
   # [R22 Fix] Validate FW_CHAIN names contain only safe characters before template injection
-  [[ "$FW_CHAIN" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN 含非法字符: $FW_CHAIN"
-  [[ "$FW_CHAIN6" =~ ^[A-Z0-9_-]+$ ]] || die "FW_CHAIN6 含非法字符: $FW_CHAIN6"
+  [[ "$FW_CHAIN" =~ ^[A-Za-z0-9_-]+$ ]] || die "FW_CHAIN 含非法字符: $FW_CHAIN"
+  [[ "$FW_CHAIN6" =~ ^[A-Za-z0-9_-]+$ ]] || die "FW_CHAIN6 含非法字符: $FW_CHAIN6"
   mkdir -p "$MANAGER_BASE"
   local fw_script="${MANAGER_BASE}/firewall-restore.sh"
   local _fw_sig="TRANSIT_FW_VERSION=${VERSION}_$(date +%Y%m%d)"
