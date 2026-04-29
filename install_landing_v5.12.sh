@@ -1202,10 +1202,11 @@ for try in 1 2; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
     # [BUG-14 FIX] 移除第一次尝试前的DNS等待 - acme.sh会自己创建TXT记录
+    # [BUG-16 FIX] 将dnssleep从0改为60 - Cloudflare DNS传播需要时间
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
-      --dnssleep 0 \
+      --dnssleep 60 \
       ${_force_opt} && issued=1 && break || true
     # [BUG-15 FIX] 删除重试间的DNS等待 - acme.sh失败后会删除TXT记录，等待无意义
     (( try < 2 )) && warn "第 ${try} 次申请失败，将立即重试..."
