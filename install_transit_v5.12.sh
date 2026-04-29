@@ -747,6 +747,7 @@ LimitNOFILE=${_tune_fd}
 TasksMax=infinity
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=/var/log/nginx /var/lib/nginx
 ProtectHome=true
 PrivateTmp=true
 UMask=0027
