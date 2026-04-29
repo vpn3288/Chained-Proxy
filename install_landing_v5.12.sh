@@ -1207,10 +1207,8 @@ for try in 1 2; do
       --server letsencrypt \
       --dnssleep 0 \
       ${_force_opt} && issued=1 && break || true
-    if (( try < 2 )); then
-      warn "第 ${try} 次申请失败，等待 DNS 传播后重试..."
-      _wait_dns_txt "$domain"
-    fi
+    # [BUG-15 FIX] 删除重试间的DNS等待 - acme.sh失败后会删除TXT记录，等待无意义
+    (( try < 2 )) && warn "第 ${try} 次申请失败，将立即重试..."
   done
   (( issued )) || die "证书申请失败（请检查 Token 权限：Zone:DNS:Edit，或 3 分钟后重试）"
 
