@@ -1201,9 +1201,7 @@ local issued=0
 for try in 1 2; do
     local _force_opt=""
     (( try > 1 )) && _force_opt="--force"
-    # [R2 Fix] Wait for DNS propagation BEFORE first issuance attempt (not just between retries)
-    # [R5 Partial Fix] Die on DNS timeout before first attempt — don't waste ACME attempts
-    (( try == 1 )) && ! _wait_dns_txt "$domain" && die "DNS TXT 记录在 120 秒内未传播，终止证书申请（请等待后重试）"
+    # [BUG-14 FIX] 移除第一次尝试前的DNS等待 - acme.sh会自己创建TXT记录
     CF_Token="$cf_token" "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --issue --dns dns_cf \
       --domain "$domain" --keylength ec-256 \
       --server letsencrypt \
