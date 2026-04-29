@@ -1065,15 +1065,21 @@ issue_certificate(){
   [[ -z "$domain" || -z "$cf_token" ]] && die "issue_certificate: domain/cf_token 为空"
 
   # [R21 Fix] Validate CF token has Zone:DNS:Edit permission before wasting ACME attempts
+  # [BUG #22 Fix] Extract root domain for Zone ID query (subdomains belong to parent zone)
+  local _zone_domain="$domain"
+  # If domain has more than 2 parts (e.g., test1.998488.xyz), extract root domain (998488.xyz)
+  if [[ $(echo "$domain" | tr '.' '\n' | wc -l) -gt 2 ]]; then
+    _zone_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+  fi
   local _zone_id
   _zone_id=$(curl -fsSL --connect-timeout 5 --max-time 10 \
     -H "Authorization: Bearer $cf_token" \
-    "https://api.cloudflare.com/client/v4/zones?name=$domain" \
+    "https://api.cloudflare.com/client/v4/zones?name=${_zone_domain}" \
     2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['result'][0]['id'] if d.get('result') else '')" 2>/dev/null) || true
   if [[ -z "$_zone_id" ]]; then
     die "Cloudflare API Token 验证失败（无法获取 Zone ID），请检查 Token 权限（需要 Zone:DNS:Edit）"
   fi
-  info "Cloudflare Zone ID: $_zone_id（Token 验证通过）"
+  info "Cloudflare Zone ID: $_zone_id（Token 验证通过，Zone: ${_zone_domain}）"
   
   # [审查者3 Fix] Set timezone to UTC for consistent cert renewal
   if ! timedatectl set-timezone UTC 2>/dev/null; then
