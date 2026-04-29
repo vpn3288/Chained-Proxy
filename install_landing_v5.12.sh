@@ -1043,6 +1043,7 @@ RELOAD_EOF
 
 issue_certificate(){
   local domain="$1" cf_token="$2"
+  local cert_dir="${CERT_BASE}/${domain}"
   
   # [L-CRITICAL-5] 证书申请延迟真实实现 - 30-90分钟随机延迟,添加Ctrl+C trap
   local delay_minutes=$((30 + RANDOM % 61))
