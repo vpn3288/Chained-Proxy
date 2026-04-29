@@ -589,7 +589,7 @@ check_deps(){
   fi
   local _bin_pkg=(
     curl:curl wget:wget unzip:unzip iptables:iptables python3:python3
-    openssl:openssl nginx:nginx ip:${ip_pkg} dig:${dig_pkg} fuser:psmisc crontab:cron chrony:chrony
+    openssl:openssl nginx:nginx ip:${ip_pkg} dig:${dig_pkg} fuser:psmisc crontab:cron chronyc:chrony
   )
   local missing_pkgs=()
   for bp in "${_bin_pkg[@]}"; do

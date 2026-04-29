@@ -432,7 +432,7 @@ check_deps(){
   fi
   local _bin_pkg=(
     curl:curl wget:wget iptables:iptables python3:python3
-    ip:${ip_pkg} nginx:nginx fuser:psmisc chrony:chrony
+    ip:${ip_pkg} nginx:nginx fuser:psmisc chronyc:chrony
   )
   local missing_pkgs=()
   for bp in "${_bin_pkg[@]}"; do
