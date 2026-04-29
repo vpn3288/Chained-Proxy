@@ -987,6 +987,7 @@ set -eu
 CERT_DIR="${1:-}"
 # [R12 Fix] Validate CERT_DIR is non-empty AND exists before any chown/chmod operations
 if [ -z "$CERT_DIR" ] || [ ! -d "$CERT_DIR" ]; then
+  echo "ERROR: Invalid CERT_DIR: '$CERT_DIR'" >&2
   logger -t acme-xray-landing "ERROR: Invalid CERT_DIR: '$CERT_DIR'"
   exit 1
 fi
@@ -1008,6 +1009,7 @@ chmod 644 "$CERT_DIR/cert.pem" "$CERT_DIR/fullchain.pem" || true
 chmod 640 "$CERT_DIR/key.pem" || true
 
 if [[ ! -s "${CERT_DIR}/fullchain.pem" ]]; then
+  echo "ERROR: fullchain.pem is empty or missing" >&2
   logger -t acme-xray-landing "ERROR: fullchain.pem is empty or missing"
   exit 1
 fi
