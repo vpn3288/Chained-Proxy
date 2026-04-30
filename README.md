@@ -114,16 +114,16 @@ chmod +x install_landing.sh
 
 ### 步骤 2: 部署中转机
 
-```bash
 # 下载脚本
+```bash
 wget -O install_transit.sh https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_transit_v5.17.sh
 ```
-```bash
 # 添加执行权限
+```bash
 chmod +x install_transit.sh
 ```
-```bash
 # 运行安装
+```bash
 ./install_transit.sh
 ```
 
