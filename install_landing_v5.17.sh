@@ -2434,7 +2434,7 @@ NEOF_TMP
         -exec grep -l "^DOMAIN=${NEW_DOMAIN}$" {} + 2>/dev/null | sed '/^$/d' | wc -l)
       if (( _refs == 0 )); then
         "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "${NEW_DOMAIN}" --ecc 2>/dev/null || true
-        rm -rf "${CERT_BASE}/${NEW_DOMAIN}" 2>/dev/null || true
+        rm -rf "${CERT_BASE:?}/${NEW_DOMAIN:?}" 2>/dev/null || true
       else
         info "保留证书 ${NEW_DOMAIN}（仍被 ${_refs} 个节点引用）"
       fi
@@ -2638,7 +2638,7 @@ delete_node(){
         "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DEL_DOMAIN" --ecc 2>/dev/null || true
         rm -rf "${ACME_HOME}/${DEL_DOMAIN}_ecc" 2>/dev/null || true
       fi
-      rm -rf "${CERT_BASE}/${DEL_DOMAIN}" 2>/dev/null || true
+      rm -rf "${CERT_BASE:?}/${DEL_DOMAIN:?}" 2>/dev/null || true
     fi
     # Both _snap_node and .deleting can now be removed — transaction succeeded
     rm -f "$_snap_node" "${DEL_CONF}.deleting" 2>/dev/null || true
@@ -3609,7 +3609,7 @@ SMFI
   if ! ( create_systemd_service ); then
     if [[ -f "${ACME_HOME}/acme.sh" ]]; then
       "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
-      rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
+      rm -rf "${CERT_BASE:?}/${DOMAIN:?}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
     _release_lock; exit 1
@@ -3617,7 +3617,7 @@ SMFI
   if ! ( create_systemd_service ); then
     if [[ -f "${ACME_HOME}/acme.sh" ]]; then
       "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
-      rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
+      rm -rf "${CERT_BASE:?}/${DOMAIN:?}" 2>/dev/null || true
     fi
     rm -f "$_final_node" "${_staged_fi_mgr:-}" 2>/dev/null || true
     _release_lock; exit 1
@@ -3641,7 +3641,7 @@ SMFI
     # [F1] Ghost cert guard: cert was issued before firewall; must revoke on firewall fail
     if [[ -f "${ACME_HOME}/acme.sh" ]]; then
       "${ACME_HOME}/acme.sh" --home "${ACME_HOME}" --remove --domain "$DOMAIN" --ecc 2>/dev/null || true
-      rm -rf "${CERT_BASE}/${DOMAIN}" 2>/dev/null || true
+      rm -rf "${CERT_BASE:?}/${DOMAIN:?}" 2>/dev/null || true
     fi
     _release_lock; exit 1
   fi
