@@ -116,10 +116,12 @@ chmod +x install_landing.sh
 ```bash
 # 下载脚本
 wget -O install_transit.sh https://raw.githubusercontent.com/vpn3288/Chained-Proxy/main/install_transit_v5.17.sh
-
+```
+```bash
 # 添加执行权限
 chmod +x install_transit.sh
-
+```
+```bash
 # 运行安装
 ./install_transit.sh
 ```
