@@ -1110,12 +1110,12 @@ issue_certificate(){
       if [[ -f "${ACME_HOME}/acme.sh" ]]; then
         # [v2.14] 任何重入都先重建一次 cron，防止上次安装中断后静默失联
         env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" --uninstall-cronjob 2>/dev/null || true
-        env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" --install-cronjob 2>/dev/null           || die "acme.sh --install-cronjob 失败！续期链路断开，无法继续。请检查 crontab 权限后重试，或手动执行: ${ACME_HOME}/acme.sh --install-cronjob"
+        env ACME_HOME="${ACME_HOME}" "${ACME_HOME}/acme.sh" --install-cronjob 2>/dev/null           || warn "acme.sh --install-cronjob 失败，但证书已有效，继续安装"
         # [R11 Fix] Relax validation: accept any acme.sh cron pointing to a valid path.
         # acme.sh hardcodes LE_WORKING_DIR in cron regardless of ACME_HOME env,
         # causing stale entries from previous installs to persist.
         if ! crontab -l 2>/dev/null | grep -qF "${ACME_HOME}/acme.sh"; then
-          die "acme.sh cron 条目验收失败（未指向 ${ACME_HOME}/acme.sh），请手动执行: ${ACME_HOME}/acme.sh --install-cronjob"
+          warn "acme.sh cron 条目验收失败，但证书已有效（剩余 ${expiry_days} 天），继续安装。请在证书到期前手动执行: ${ACME_HOME}/acme.sh --install-cronjob"
         fi
       fi
       return 0
