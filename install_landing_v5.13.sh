@@ -490,7 +490,7 @@ validate_domain(){
   (( ${#d} >= 4 && ${#d} <= 253 )) || { error "域名长度非法 (${#d}): $d"; return 1; }
   [[ "$d" == *".."* ]] && { error "域名不能包含连续的点: $d"; return 1; }
   [[ "$d" == *"."* ]] || { error "域名必须包含至少一个点: $d"; return 1; }
-  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || { error "域名格式非法: $d"; return 1; }
+  printf '%s' "$d" | python3 -c "import sys,re; d=sys.stdin.read().strip(); pat=re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-_]{0,61}[a-zA-Z0-9])?))*\.[a-zA-Z0-9]{2,}$'); sys.exit(0 if pat.match(d) else 1)" >/dev/null 2>&1 || { error "域名格式非法: $d"; return 1; }
 }
 
 validate_ipv4(){
