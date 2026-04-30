@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_landing_v5.16.sh — 落地机安装脚本 v5.16
+# install_landing_v5.17.sh — 落地机安装脚本 v5.17
+# v5.17 变更记录 (2026-04-30 BUG #36修复 - 交互式容错增强)
+# BUG #36: fresh_install()所有输入点添加while循环重试，输错不die而是提示重新输入
+# 修复范围：域名/Token/密码/IP/端口输入，add_node()的Token输入，do_set_port()的端口输入
+# 用户体验：真正实现"小白友好"，输入错误可重试，不会因一次错误就退出脚本
+# v5.16 变更记录 (2026-04-30 版本号统一)
+# 统一落地机和中转机脚本版本号为v5.16
 # v5.15 变更记录 (2026-04-30 BUG #33-34修复 - 卸载残留问题)
 # BUG #33: purge_all()无条件删除xray-landing用户(不依赖CREATED_USER标志)
 # BUG #34: purge_all()删除nginx drop-in目录(/etc/systemd/system/nginx.service.d)
@@ -2364,9 +2370,16 @@ PYIP
 
   local USE_CF_TOKEN="$CF_TOKEN"
   if [[ -z "$USE_CF_TOKEN" ]]; then
-    read -rp "Cloudflare API Token（Zone:DNS:Edit）: " USE_CF_TOKEN
-    validate_cf_token "$USE_CF_TOKEN"
-    CF_TOKEN="$USE_CF_TOKEN"
+    # [BUG #36] Token输入添加循环重试
+    while true; do
+      read -rp "Cloudflare API Token（Zone:DNS:Edit）: " USE_CF_TOKEN
+      if validate_cf_token "$USE_CF_TOKEN" 2>/dev/null; then
+        CF_TOKEN="$USE_CF_TOKEN"
+        break
+      else
+        error "Token格式错误，请重新输入（40位以上，仅字母数字_-）"
+      fi
+    done
   fi
 
   # v2.32: 所有用户输入已收集，加锁后才开始写操作
@@ -2645,8 +2658,19 @@ do_set_port(){
   _prev_int_trap=$(trap -p INT 2>/dev/null || echo "")
   _prev_term_trap=$(trap -p TERM 2>/dev/null || echo "")
   local new_port="${1:-}"
-  [[ -n "$new_port" ]] || { read -rp "新落地机监听端口: " new_port; }
-  validate_port "$new_port"
+  if [[ -z "$new_port" ]]; then
+    # [BUG #36] 端口输入添加循环重试
+    while true; do
+      read -rp "新落地机监听端口: " new_port
+      if validate_port "$new_port" 2>/dev/null; then
+        break
+      else
+        error "端口格式错误，请重新输入（1-65535）"
+      fi
+    done
+  else
+    validate_port "$new_port"
+  fi
   (( new_port >= 1024 )) || die "端口 ${new_port} 小于 1024，set-port 不支持低端口（需重装以更新权限配置）"
   # [R19 Fix] Check for conflict with internal ports (VLESS_GRPC, TROJAN_GRPC, VLESS_WS, TROJAN_TCP)
   for _internal_port in "$VLESS_GRPC_PORT" "$TROJAN_GRPC_PORT" "$VLESS_WS_PORT" "$TROJAN_TCP_PORT"; do
@@ -3348,23 +3372,59 @@ fresh_install(){
     fi
     info "检测到无头静默安装模式，已跳过交互输入"
   else
-    read -rp "落地机域名（CF 灰云，DNS 可指向任意 IP）: " DOMAIN
-    DOMAIN=$(trim "$(tr '[:upper:]' '[:lower:]' <<< "$DOMAIN")")
-    validate_domain "$DOMAIN"
-    read -rp "Cloudflare API Token（Zone:DNS:Edit）: " CF_TOKEN
-    validate_cf_token "$CF_TOKEN"
-    read -rp "Trojan 密码（16位以上，直接回车自动生成）: " PASS
-    if [[ -z "$PASS" ]]; then
-      PASS=$(gen_password)
-      info "  已自动生成高强度密码: ${PASS}"
-    fi
-    validate_password "$PASS"
-    read -rp "中转机公网 IP（防火墙白名单）: " TRANSIT_IP
-    validate_ipv4 "$TRANSIT_IP"
-    read -rp "落地机监听端口（默认 8443）[8443]: " LANDING_PORT_IN
-    LANDING_PORT_IN="${LANDING_PORT_IN:-8443}"
-    validate_port "$LANDING_PORT_IN"
-    LANDING_PORT="$LANDING_PORT_IN"
+    # [BUG #36] 添加输入循环重试机制，输错不die而是提示重新输入
+    while true; do
+      read -rp "落地机域名（CF 灰云，DNS 可指向任意 IP）: " DOMAIN
+      DOMAIN=$(trim "$(tr '[:upper:]' '[:lower:]' <<< "$DOMAIN")")
+      if validate_domain "$DOMAIN" 2>/dev/null; then
+        break
+      else
+        error "域名格式错误，请重新输入（例如：example.998488.xyz）"
+      fi
+    done
+    
+    while true; do
+      read -rp "Cloudflare API Token（Zone:DNS:Edit）: " CF_TOKEN
+      if validate_cf_token "$CF_TOKEN" 2>/dev/null; then
+        break
+      else
+        error "Token格式错误，请重新输入（40位以上，仅字母数字_-）"
+      fi
+    done
+    
+    while true; do
+      read -rp "Trojan 密码（16位以上，直接回车自动生成）: " PASS
+      if [[ -z "$PASS" ]]; then
+        PASS=$(gen_password)
+        info "  已自动生成高强度密码: ${PASS}"
+        break
+      fi
+      if validate_password "$PASS" 2>/dev/null; then
+        break
+      else
+        error "密码格式错误，请重新输入（16位以上）"
+      fi
+    done
+    
+    while true; do
+      read -rp "中转机公网 IP（防火墙白名单）: " TRANSIT_IP
+      if validate_ipv4 "$TRANSIT_IP" 2>/dev/null; then
+        break
+      else
+        error "IP格式错误，请重新输入（例如：1.2.3.4）"
+      fi
+    done
+    
+    while true; do
+      read -rp "落地机监听端口（默认 8443）[8443]: " LANDING_PORT_IN
+      LANDING_PORT_IN="${LANDING_PORT_IN:-8443}"
+      if validate_port "$LANDING_PORT_IN" 2>/dev/null; then
+        LANDING_PORT="$LANDING_PORT_IN"
+        break
+      else
+        error "端口格式错误，请重新输入（1-65535）"
+      fi
+    done
     
     # [L-CRITICAL-1] 1Panel/Docker额外端口收集
     echo ""

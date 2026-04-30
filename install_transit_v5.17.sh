@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_transit_v5.16.sh — 中转机安装脚本 v5.16
-# v5.12 变更记录 (2026-04-29 主笔AI第二十轮修复 - 21项审计发现全面修复)
-# 本版本根据代码审计报告修复所有剩余Transit问题:
+# install_transit_v5.17.sh — 中转机安装脚本 v5.17
+# v5.17 变更记录 (2026-04-30 BUG #36修复 - 交互式容错增强)
+# BUG #36: add_node()所有输入点已有while循环重试机制（IP/域名/端口）
+# 用户体验：输入错误可重试，不会因一次错误就退出脚本
+# v5.16 变更记录 (2026-04-30 版本号统一)
+# 统一落地机和中转机脚本版本号为v5.16
 # [REVIEWER-T-1] CRITICAL: get_public_ip() IFS恢复使用local而非trap(自动作用域恢复)
 # [REVIEWER-T-2] MEDIUM: domain_to_safe()使用awk提取SHA256(更清晰)
 # [REVIEWER-T-3] HIGH: _route_key_conflict()使用命令替换而非进程替换(修复变量丢失)
