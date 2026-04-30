@@ -772,14 +772,14 @@ write_logrotate(){
   atomic_write "$LOGROTATE_FILE" 644 root:root <<EOF
 ${LOG_DIR}/*.log
 {
-    su root root
+    su www-data adm
     daily
     rotate 7
     missingok
     notifempty
     compress
     delaycompress
-    create 0640 root adm
+    create 0640 www-data adm
     sharedscripts
     postrotate
         # [v2.7 Gemini-Doc2-🟠] --kill-who=main: deliver USR1 exclusively to the nginx master
@@ -814,6 +814,13 @@ init_nginx_stream(){
   mkdir -p "$LOG_DIR"
   chown root:adm "$LOG_DIR" 2>/dev/null || true
   chmod 750 "$LOG_DIR"
+  
+  # [BUG #38 FIX] 创建日志文件并设置 www-data 可写权限
+  # Nginx worker 进程以 www-data 用户运行，需要写入权限
+  touch "${LOG_DIR}/transit_stream_error.log"
+  chown www-data:adm "${LOG_DIR}/transit_stream_error.log"
+  chmod 640 "${LOG_DIR}/transit_stream_error.log"
+  
   mkdir -p "$SNIPPETS_DIR" "$CONF_DIR"
   chmod 700 "$SNIPPETS_DIR"
   rm -f "${SNIPPETS_DIR}/landing_dummy.map" "${SNIPPETS_DIR}/landing_*.map.tmp" 2>/dev/null || true
