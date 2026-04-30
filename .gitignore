@@ -1,0 +1,45 @@
+# Test files
+test-*.sh
+test-*.exp
+test-*.log
+test-*.md
+*-test-*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Logs
+*.log
+logs/
+
+# Credentials (should never be committed)
+*.key
+*.pem
+*.crt
+*token*
+*password*
+*secret*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+
+# Node modules (if any)
+node_modules/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local test environment
+test-env/
+local-test/
