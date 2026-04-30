@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_landing_v5.15.sh — 落地机安装脚本 v5.15
+# install_landing_v5.16.sh — 落地机安装脚本 v5.16
 # v5.15 变更记录 (2026-04-30 BUG #33-34修复 - 卸载残留问题)
 # BUG #33: purge_all()无条件删除xray-landing用户(不依赖CREATED_USER标志)
 # BUG #34: purge_all()删除nginx drop-in目录(/etc/systemd/system/nginx.service.d)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
-# install_transit_v5.00.sh — 中转机安装脚本 v4.90
+# install_transit_v5.16.sh — 中转机安装脚本 v5.16
 # v5.12 变更记录 (2026-04-29 主笔AI第二十轮修复 - 21项审计发现全面修复)
 # 本版本根据代码审计报告修复所有剩余Transit问题:
 # [REVIEWER-T-1] CRITICAL: get_public_ip() IFS恢复使用local而非trap(自动作用域恢复)
