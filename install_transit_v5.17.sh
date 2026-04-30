@@ -316,7 +316,7 @@ domain_to_safe()  {
   local raw
   local hash
   raw="$(printf '%s' "$1" | tr '.' '_' | tr -cd 'a-zA-Z0-9_-')"
-  hash="$(printf '%s' "$1" | sha256sum | awk '{print substr(\,1,64)}')"
+  hash="$(printf '%s' "$1" | sha256sum | awk '{print substr($1,1,64)}')"
   printf '%s_%s' "${raw:0:60}" "$hash"
 }
 nginx_domain_str(){ printf '%s' "$1" | tr -cd 'a-zA-Z0-9._-'; }
