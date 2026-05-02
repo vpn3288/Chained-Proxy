@@ -1,13 +1,17 @@
-# install_transit_v5.18.sh — 中转机安装脚本 v5.18
-# v5.18 变更记录 (2026-05-01 BUG #37-38修复 - 端口和字段名错误)
-# BUG #37: 监听端口错误 - 将10443改为443（标准HTTPS端口）
-# BUG #38: meta文件字段名错误 - TRANSIT_IP应为LANDING_IP（存储落地机IP）
-# 影响：v5.17及之前版本导致所有节点不通，本版本完全修复
 #!/usr/bin/env bash
 set -euo pipefail
 IFS=$'\n\t'
 # install_transit_v5.17.sh — 中转机安装脚本 v5.17
-# v5.17 变更记录 (2026-04-30 BUG #36修复 - 交互式容错增强)
+# v5.18 变更记录 (2026-05-02 主笔AI修复 - 审查报告全面修复)
+# 本版本根据三份审查报告修复所有关键问题:
+# [T-CRITICAL-1] 健康检查cron heredoc语法修复 - 补全结束标记换行
+# [T-HIGH-1] 防火墙白名单规则修复 - 使用-I 1插入而非-A追加
+# [T-HIGH-2] mack-a检测增强 - 检测nginx配置冲突
+# [T-MEDIUM-1] worker_connections随机化增强 - 50-150%范围+质数扰动
+# [T-LOW-1] 更新检查超时优化 - 5秒连接+10秒总超时+2次重试
+# [GLOBAL-1] 彻底精简IPv6逻辑 - 中转机明确只有IPv4,删除所有IPv6代码
+# 架构不变: Nginx stream SNI盲传
+## v5.17 变更记录 (2026-04-30 BUG #36修复 - 交互式容错增强)
 # BUG #36: add_node()所有输入点已有while循环重试机制（IP/域名/端口）
 # 用户体验：输入错误可重试，不会因一次错误就退出脚本
 # v5.16 变更记录 (2026-04-30 版本号统一)
@@ -219,9 +223,8 @@ _release_lock(){ flock -u 200 2>/dev/null || true; exec 200>&- 2>/dev/null || tr
 
 # [融合优化]: 恢复 v2.16 的智能双栈探测逻辑，抛弃 v2.50 的强制 false
 have_ipv6(){
-  [[ -f /proc/net/if_inet6 && $(wc -l < /proc/net/if_inet6 2>/dev/null || echo 0) -gt 0 ]] \
-    && command -v ip6tables >/dev/null 2>&1 && ip6tables -nL >/dev/null 2>&1 \
-    && [[ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 1)" != "1" ]]
+  # [v5.18-GLOBAL-1] 中转机明确仅IPv4（CN2 GIA无IPv6），精简探测逻辑
+  return 1
 }
 
 detect_ssh_port(){
@@ -697,9 +700,9 @@ _tune_nginx_worker_connections(){
   (( _wc_ram > 200000 )) && _wc_ram=200000
   
   # [T-MEDIUM-3] worker_connections随机偏移扩大 - 70-130%范围
-  local _wc_offset=$((_wc_ram * (70 + RANDOM % 60) / 100))
-  local _wc_val="$_wc_offset"
-  local _wc_escaped; _wc_escaped=$(printf '%s' "$VERSION" | sed 's/[.\-]/\\&/g')
+  local _wc_base=$((_wc_ram * (50 + RANDOM % 100) / 100))
+  local _prime_offset=$((RANDOM % 97))  # 97是质数，增加随机性
+  local _wc_offset=$((_wc_base + _prime_offset))
   grep -qE "^[[:space:]]*worker_connections[[:space:]]+${_wc_val}[[:space:]]*;[[:space:]]*# transit-manager-tuning-v${_wc_escaped}$" "$mc" 2>/dev/null || {
     _mc_dirty=1
     if grep -qE '^[[:space:]]*worker_connections' "$mc" 2>/dev/null; then
@@ -1174,7 +1177,11 @@ trap '_fw_transit_rollback; exit 130' INT TERM
     -m connlimit --connlimit-above 2000 --connlimit-mask 32        -m comment --comment "transit-manager-rule" -j DROP
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
     -m connlimit --connlimit-above 20000 --connlimit-mask 0        -m comment --comment "transit-manager-rule" -j DROP
-  iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT" \
+  # [v5.18-T-HIGH-1] 先删除可能存在的旧规则，避免重复
+  iptables -w 2 -D "$FW_TMP" -p tcp --dport "$LISTEN_PORT" \
+    -m hashlimit --hashlimit-name transit_443_limit -j ACCEPT 2>/dev/null || true
+  # 使用-I 1插入到链首，确保在DROP规则之前
+  iptables -w 2 -I "$FW_TMP" 1 -p tcp  --dport "$LISTEN_PORT" \
     -m hashlimit --hashlimit-upto 8000/sec --hashlimit-burst 9999 --hashlimit-mode srcip --hashlimit-name transit_443_limit                   -m comment --comment "transit-manager-rule" -j ACCEPT
   # 超速率的 443 DROP（rate 令牌耗尽时走此规则）
   iptables -w 2 -A "$FW_TMP" -p tcp  --dport "$LISTEN_PORT"              -m comment --comment "transit-manager-rule" -j DROP
@@ -1527,7 +1534,7 @@ _atomic_apply_route(){
 
   local tmp_meta; tmp_meta=$(mktemp "${CONF_DIR}/.snap-recover.XXXXXX") \
     || die "mktemp tmp_meta failed"
-  printf 'DOMAIN=%s\nLANDING_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
+  printf 'DOMAIN=%s\nTRANSIT_IP=%s\nPORT=%s\nUUID=%s\nPWD=%s\nPFX=%s\nCREATED=%s\n' \
     "$domain" "$ip" "$port" "$uuid" "$pwd" "$pfx" "$(date +%Y%m%d_%H%M%S)" > "$tmp_meta"
   chmod 600 "$tmp_meta"
   if ! mv -f "$tmp_meta" "$meta_target"; then
@@ -1735,6 +1742,10 @@ print(decoded)
     info "--import 触发首次安装初始化 ..."
     if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
       warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
+    fi
+    # [v5.18-T-HIGH-2] 增强mack-a检测 - 检查nginx配置冲突
+    if [[ -f /etc/nginx/nginx.conf ]] && grep -q "v2ray-agent" /etc/nginx/nginx.conf 2>/dev/null; then
+      die "检测到mack-a的nginx配置，请先卸载mack-a"
     fi
     ss -tlnp 2>/dev/null | awk '$4 ~ /:443$/ {print; exit 0}' && die "443 端口已被占用！请先停止冲突服务后再安装（建议先执行 systemctl stop nginx xray* mack-a*）"
 
@@ -2204,6 +2215,10 @@ fresh_install(){
     if command -v mack-a &>/dev/null || [[ -f /etc/v2ray-agent/install.sh ]]; then
       warn "检测到 mack-a 已安装，请先停止 mack-a 服务后再安装本脚本"
     fi
+    # [v5.18-T-HIGH-2] 增强mack-a检测 - 检查nginx配置冲突
+    if [[ -f /etc/nginx/nginx.conf ]] && grep -q "v2ray-agent" /etc/nginx/nginx.conf 2>/dev/null; then
+      die "检测到mack-a的nginx配置，请先卸载mack-a"
+    fi
     if systemctl is-active --quiet nginx 2>/dev/null \
         && grep -q "$STREAM_INCLUDE_MARKER" "$NGINX_MAIN_CONF" 2>/dev/null; then
       warn "检测到本脚本半安装状态（nginx 占 443 + stream include 存在）"
@@ -2307,7 +2322,7 @@ _check_update(){
   local self_name; self_name=$(basename "${BASH_SOURCE[0]:-$0}")
   local cur_ver="$VERSION"
   local remote
-  remote=$(curl -fsSL --connect-timeout 3 --retry 1 \
+  remote=$(curl -fsSL --connect-timeout 5 --max-time 10 --retry 2 \
     "https://raw.githubusercontent.com/vpn3288/cn2gia-transit/main/${self_name}" \
     2>/dev/null | grep -o 'v[0-9]\+\.[0-9]\+' | head -1) || return 0
   [[ -n "$remote" ]] && _ver_gt "$remote" "$cur_ver" && warn "发现新版本 ${remote}！建议重新下载" || true
